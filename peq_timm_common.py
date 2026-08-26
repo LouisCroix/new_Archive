@@ -1283,7 +1283,7 @@ def create_stage_parser(stage: str) -> argparse.ArgumentParser:
         raise ValueError(stage)
     parser = argparse.ArgumentParser(description=f"PEQ ImageNet-1K {stage} with timm")
     add_model_arguments(parser)
-    parser.add_argument("--data-root", default="/weka/scratch/bhattad/datasets/imagenet")
+    parser.add_argument("--data-root", default="/cis/home/cyang140/datasets/imagenet")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--batch-size", type=int, default=512, help="batch size per GPU")
     parser.add_argument("--validation-batch-size", type=int, default=None)

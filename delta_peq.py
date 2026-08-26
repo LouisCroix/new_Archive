@@ -272,7 +272,7 @@ if DELTA_BACKEND in {"fla", "chunk"} and not use_amp:
     raise ValueError(f"DELTA_BACKEND={DELTA_BACKEND} requires AMP=1")
 if DELTA_BACKEND in {"fla", "chunk", "fused_recurrent"}:
     require_fla()
-DATA_ROOT = os.environ.get("DATA_ROOT", "/home/bhattad/scratchbhattad/datasets/imagenet")
+DATA_ROOT = os.environ.get("DATA_ROOT", "/cis/home/cyang140/datasets/imagenet")
 IMG = int(os.environ.get("IMG", 128))
 RESIZE = int(os.environ.get("RESIZE", round(IMG * 146 / 128)))
 L = (IMG // PATCH) ** 2

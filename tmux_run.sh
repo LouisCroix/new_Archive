@@ -1,5 +1,5 @@
 # start tmux on cpu node
-/home/cyang140/.conda/envs/tmux-tools/bin/tmux new -s peq1
+/usr/bin/tmux new -s peq1
 
 salloc \
   --job-name=intr1 \
@@ -21,7 +21,7 @@ bash scripts/run_imagenet_delta_peq.sbatch
 # ctrl+b then d
 
 # list all tmux sessions
-/home/cyang140/.conda/envs/tmux-tools/bin/tmux ls
+/usr/bin/tmux ls
 
 # reattach to the session
-/home/cyang140/.conda/envs/tmux-tools/bin/tmux attach -t peq1
+/usr/bin/tmux attach -t peq1
