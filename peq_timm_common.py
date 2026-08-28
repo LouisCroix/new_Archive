@@ -1,10 +1,9 @@
-"""Shared PEQ model and timm-based ImageNet training utilities."""
+"""Shared Delta-PEQ model and timm-based ImageNet training utilities."""
 
 from __future__ import annotations
 
 import argparse
 import logging
-import math
 import os
 import random
 import shutil
@@ -21,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from PIL import ImageFilter, ImageOps
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Sampler, Subset
 from torch.utils.data.distributed import DistributedSampler
@@ -29,12 +29,13 @@ from torchvision import datasets, transforms
 from timm.data import Mixup, create_transform
 from timm.data.distributed_sampler import RepeatAugSampler
 from timm.data.transforms import RandomResizedCropAndInterpolation
-from timm.layers import DropPath
 from timm.loss import BinaryCrossEntropy, LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 from timm.utils import ModelEmaV3, NativeScaler, dispatch_clip_grad
 from timm.utils import init_distributed_device, is_primary, random_seed, setup_default_logging
+
+from deltanet import DELTA_BACKENDS, DeltaNet, require_fla
 
 
 LOG = logging.getLogger("peq_timm")
@@ -42,7 +43,39 @@ DATA_MODES = {"tied_data", "tied_data_rec"}
 VALID_MODES = {"single", "tied", "untied", "tied_data", "tied_data_rec"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-LoraCache = dict[int, tuple[int, torch.Tensor]]
+MODEL_FAMILY = "delta_peq"
+MODEL_ARCHITECTURES = {
+    "sequential": "sequential_patch_delta_softmax_stages_v1",
+    "rats": "rats_patch_delta_shared_qkv_identity_registers_v1",
+}
+CHECKPOINT_FORMAT_VERSION = 2
+
+
+def parse_n_reg_schedule(value: str | int | tuple[int, ...] | list[int]) -> tuple[int, ...]:
+    if isinstance(value, int):
+        values = (value,)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        parts = [part.strip() for part in raw.split(",")]
+        if not parts or any(not part for part in parts):
+            raise ValueError(
+                "n-reg must be a positive integer or a comma-separated schedule"
+            )
+        try:
+            values = tuple(int(part) for part in parts)
+        except ValueError as exc:
+            raise ValueError(
+                "n-reg must be a positive integer or a comma-separated schedule"
+            ) from exc
+    else:
+        values = tuple(int(item) for item in value)
+    if not values or any(item < 1 for item in values):
+        raise ValueError(
+            "n-reg must contain one or more positive integers"
+        )
+    return values
 
 
 @dataclass(frozen=True)
@@ -50,43 +83,64 @@ class ModelConfig:
     image_size: int = 224
     patch_size: int = 16
     dim: int = 384
-    n_reg: int = 8
+    n_reg_schedule: tuple[int, ...] = (8,)
     heads: int = 6
     steps: int = 4
     num_classes: int = 1000
     mode: str = "tied"
-    attention: str = "softmax"
-    func_k: int = 64
-    func_lambda: float = 1.0
-    lora_rank: int = 0
-    lora_alpha: float = 1.0
-    lora_compose: str = "indep"
-    lora_dz: int = 64
+    attention: str = "sequential"
+    sdpa_backend: str = "flash"
+    delta_backend: str = "auto"
+    delta_chunk_size: int = 64
+    readout: str = "reg"
     rmsnorm: bool = False
     layerscale: bool = False
     layerscale_init: float = 1e-4
-    qk_rms_norm: bool = True
-    qk_rms_eps: float = 1e-6
-    rope: bool = False
-    rope_base: float = 100.0
-    reg_rope: bool = True
-    reg_rope_theta: float = 10000.0
     gamma_d: float = 0.5
-    drop_path: float = 0.05
+    delta_conv_size: int = 4
+    delta_norm_eps: float = 1e-5
+    model_family: str = MODEL_FAMILY
+    model_arch: str = ""
 
     def __post_init__(self) -> None:
         if self.mode not in VALID_MODES:
             raise ValueError(f"Unsupported mode={self.mode}; choose from {sorted(VALID_MODES)}")
-        if self.attention not in {"softmax", "funcattn"}:
-            raise ValueError("attention must be softmax or funcattn")
-        if self.lora_compose not in {"indep", "cumul", "recur"}:
-            raise ValueError("lora_compose must be indep, cumul, or recur")
+        if self.attention not in MODEL_ARCHITECTURES:
+            raise ValueError("attention must be sequential or rats")
+        if self.sdpa_backend not in {"flash", "auto"}:
+            raise ValueError("sdpa_backend must be flash or auto")
+        if self.delta_backend not in DELTA_BACKENDS:
+            raise ValueError(
+                f"delta_backend must be one of {sorted(DELTA_BACKENDS)}"
+            )
+        if self.delta_chunk_size not in {16, 32, 64}:
+            raise ValueError("delta_chunk_size must be 16, 32, or 64")
+        if self.readout not in {"reg", "weighted", "patch", "sum", "concat"}:
+            raise ValueError("readout must be reg, weighted, patch, sum, or concat")
         if self.dim % self.heads:
             raise ValueError(f"dim={self.dim} must be divisible by heads={self.heads}")
         if self.image_size % self.patch_size:
             raise ValueError("image_size must be divisible by patch_size")
-        if self.steps < 1 or self.n_reg < 1:
-            raise ValueError("steps and n_reg must be positive")
+        if self.steps < 1:
+            raise ValueError("steps must be positive")
+        schedule = parse_n_reg_schedule(self.n_reg_schedule)
+        if len(schedule) == 1:
+            schedule = schedule * self.steps
+        elif len(schedule) != self.steps:
+            raise ValueError(
+                f"n_reg_schedule must contain one value or steps={self.steps} values"
+            )
+        object.__setattr__(self, "n_reg_schedule", schedule)
+        if self.delta_conv_size != 4 or self.delta_norm_eps != 1e-5:
+            raise ValueError("Delta-PEQ requires delta_conv_size=4 and delta_norm_eps=1e-5")
+        if self.model_family != MODEL_FAMILY:
+            raise ValueError(f"model_family must be {MODEL_FAMILY}")
+        expected_arch = MODEL_ARCHITECTURES[self.attention]
+        if self.model_arch and self.model_arch != expected_arch:
+            raise ValueError(
+                f"model_arch={self.model_arch!r} does not match attention={self.attention}"
+            )
+        object.__setattr__(self, "model_arch", expected_arch)
 
     @property
     def num_patches(self) -> int:
@@ -96,31 +150,34 @@ class ModelConfig:
     def head_dim(self) -> int:
         return self.dim // self.heads
 
+    @property
+    def max_n_reg(self) -> int:
+        return max(self.n_reg_schedule)
+
+    @property
+    def n_reg_label(self) -> str:
+        if len(set(self.n_reg_schedule)) == 1:
+            return str(self.n_reg_schedule[0])
+        return "x".join(str(value) for value in self.n_reg_schedule)
+
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "ModelConfig":
         aliases = {
             "img": "image_size",
             "patch": "patch_size",
             "D": "dim",
-            "n_reg": "n_reg",
-            "heads": "heads",
+            "n_reg": "n_reg_schedule",
             "T": "steps",
+            "heads": "heads",
             "attn": "attention",
-            "funck": "func_k",
-            "func_lambda": "func_lambda",
-            "lora_rank": "lora_rank",
-            "lora_alpha": "lora_alpha",
-            "lora_compose": "lora_compose",
-            "lora_dz": "lora_dz",
+            "n_reg_schedule": "n_reg_schedule",
+            "sdpa_backend": "sdpa_backend",
+            "delta_backend": "delta_backend",
+            "delta_chunk_size": "delta_chunk_size",
+            "readout": "readout",
             "rmsnorm": "rmsnorm",
             "layerscale": "layerscale",
             "ls_init": "layerscale_init",
-            "qk_rms_norm": "qk_rms_norm",
-            "qk_rms_eps": "qk_rms_eps",
-            "rope": "rope",
-            "rope_base": "rope_base",
-            "reg_rope": "reg_rope",
-            "reg_rope_theta": "reg_rope_theta",
             "gamma_d0": "gamma_d",
         }
         fields = cls.__dataclass_fields__
@@ -146,255 +203,126 @@ class RMSNorm(nn.Module):
 
 
 def _norm(cfg: ModelConfig, dim: int) -> nn.Module:
-    return RMSNorm(dim, cfg.qk_rms_eps) if cfg.rmsnorm else nn.LayerNorm(dim)
+    return RMSNorm(dim, cfg.delta_norm_eps) if cfg.rmsnorm else nn.LayerNorm(dim)
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+def _softmax_attention(
+    cfg: ModelConfig,
+    module: nn.MultiheadAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    return_weights: bool = False,
+):
+    context = (
+        sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+        if query.device.type == "cuda" and cfg.sdpa_backend == "flash"
+        else nullcontext()
+    )
+    with context:
+        output, weights = module(
+            query,
+            key,
+            value,
+            need_weights=return_weights,
+            average_attn_weights=True,
+        )
+    return (output, weights) if return_weights else output
 
 
-def _build_2d_rope(grid: int, head_dim: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
-    if head_dim % 4:
-        raise ValueError(f"2D axial RoPE requires head_dim divisible by 4, got {head_dim}")
-    dim = head_dim // 2
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-    positions = torch.arange(grid).float()
-    freq = torch.outer(positions, freqs).repeat_interleave(2, dim=-1)
-    fy = freq[:, None, :].expand(grid, grid, -1)
-    fx = freq[None, :, :].expand(grid, grid, -1)
-    phases = torch.cat([fy, fx], dim=-1).reshape(grid * grid, head_dim)
-    return phases.cos()[None, None], phases.sin()[None, None]
+class RATSAttention(nn.Module):
+    """Shared QKV with identity register projections in refine and broadcast."""
 
-
-def _build_1d_rope(n: int, head_dim: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
-    if head_dim % 2:
-        raise ValueError(f"1D RoPE requires even head_dim, got {head_dim}")
-    freqs = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-    phases = torch.outer(torch.arange(n).float(), freqs).repeat_interleave(2, dim=-1)
-    return phases.cos()[None, None], phases.sin()[None, None]
-
-
-def _apply_rope(
-    x: torch.Tensor,
-    rope: Optional[tuple[torch.Tensor, torch.Tensor]],
-) -> torch.Tensor:
-    if rope is None:
-        return x
-    cos, sin = rope
-    cos = cos.to(device=x.device, dtype=x.dtype)
-    sin = sin.to(device=x.device, dtype=x.dtype)
-    return x * cos + _rotate_half(x) * sin
-
-
-class LoraLinear(nn.Module):
-    def __init__(self, cfg: ModelConfig, fin: int, fout: int, rank: int):
-        super().__init__()
-        self.base = nn.Linear(fin, fout)
-        self.rank = rank
-        self.compose = cfg.lora_compose
-        self.scale = cfg.lora_alpha / rank if rank else 1.0
-        if rank > 0:
-            if self.compose == "recur":
-                self.A = nn.Parameter(torch.randn(rank, fin) * (1.0 / math.sqrt(fin)))
-                self.B = nn.Parameter(torch.zeros(fout, rank))
-                self.gate = nn.Linear(cfg.lora_dz, rank)
-            else:
-                self.A = nn.Parameter(torch.randn(cfg.steps - 1, rank, fin) * (1.0 / math.sqrt(fin)))
-                self.B = nn.Parameter(torch.zeros(cfg.steps - 1, fout, rank))
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: int = 0,
-        z: Optional[torch.Tensor] = None,
-        cache: Optional[LoraCache] = None,
-    ) -> torch.Tensor:
-        out = self.base(x)
-        if self.rank == 0:
-            return out
-        if self.compose == "recur":
-            if z is None:
-                raise ValueError("lora_compose=recur requires recurrent state z")
-            gate = self.gate(z)
-            return out + (((x @ self.A.T) * gate[:, None, :]) @ self.B.T) * self.scale
-        if t > 0:
-            if self.compose == "cumul":
-                key = id(self)
-                cached = cache.get(key) if cache is not None else None
-                last_t, delta = cached if cached is not None else (0, None)
-                if t < last_t:
-                    raise ValueError("cumulative LoRA cache received decreasing step indices")
-                if t > last_t:
-                    new_delta = torch.einsum(
-                        "sor,sri->oi", self.B[last_t:t], self.A[last_t:t]
-                    )
-                    delta = new_delta if delta is None else delta + new_delta
-                    if cache is not None:
-                        cache[key] = (t, delta)
-                out = out + F.linear(x, delta) * self.scale
-            else:
-                out = out + ((x @ self.A[t - 1].T) @ self.B[t - 1].T) * self.scale
-        return out
-
-
-class QKRMSMultiheadAttention(nn.Module):
-    def __init__(self, cfg: ModelConfig, lora_rank: int):
-        super().__init__()
-        self.dim = cfg.dim
-        self.heads = cfg.heads
-        self.head_dim = cfg.head_dim
-        self.q_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        self.k_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        self.v_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        self.out_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        if cfg.qk_rms_norm:
-            self.q_norm = RMSNorm(self.head_dim, cfg.qk_rms_eps)
-            self.k_norm = RMSNorm(self.head_dim, cfg.qk_rms_eps)
-        else:
-            self.q_norm = nn.Identity()
-            self.k_norm = nn.Identity()
-
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, seq, _ = x.shape
-        return x.view(bsz, seq, self.heads, self.head_dim).transpose(1, 2)
-
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, _, seq, _ = x.shape
-        return x.transpose(1, 2).contiguous().view(bsz, seq, self.dim)
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        t: int = 0,
-        z: Optional[torch.Tensor] = None,
-        rope_q: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        rope_k: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        lora_cache: Optional[LoraCache] = None,
-    ) -> torch.Tensor:
-        q = self.q_norm(self._split_heads(self.q_proj(query, t, z, lora_cache)))
-        k = self.k_norm(self._split_heads(self.k_proj(key, t, z, lora_cache)))
-        v = self._split_heads(self.v_proj(value, t, z, lora_cache))
-        q, k = _apply_rope(q, rope_q), _apply_rope(k, rope_k)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        return self.out_proj(self._merge_heads(out), t, z, lora_cache)
-
-
-class FuncAttention(nn.Module):
-    def __init__(self, cfg: ModelConfig, lora_rank: int):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.dim = cfg.dim
-        self.heads = cfg.heads
-        self.head_dim = cfg.head_dim
-        self.q_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        self.k_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        self.v_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        self.out_proj = LoraLinear(cfg, cfg.dim, cfg.dim, lora_rank)
-        self.phi = LoraLinear(cfg, cfg.dim, cfg.heads * cfg.func_k, lora_rank)
-        self.psi = LoraLinear(cfg, cfg.dim, cfg.heads * cfg.func_k, lora_rank)
-        if cfg.qk_rms_norm:
-            self.q_norm = RMSNorm(self.head_dim, cfg.qk_rms_eps)
-            self.k_norm = RMSNorm(self.head_dim, cfg.qk_rms_eps)
-        else:
-            self.q_norm = nn.Identity()
-            self.k_norm = nn.Identity()
+        self.q_proj = nn.Linear(cfg.dim, cfg.dim)
+        self.k_proj = nn.Linear(cfg.dim, cfg.dim)
+        self.v_proj = nn.Linear(cfg.dim, cfg.dim)
+        self.out_proj = nn.ModuleDict(
+            {
+                stage: nn.Linear(cfg.dim, cfg.dim)
+                for stage in ("compress", "refine", "broadcast")
+            }
+        )
 
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, seq, _ = x.shape
-        return x.view(bsz, seq, self.heads, self.head_dim).transpose(1, 2)
-
-    def _basis(
-        self,
-        layer: LoraLinear,
-        x: torch.Tensor,
-        t: int,
-        z: Optional[torch.Tensor],
-        lora_cache: Optional[LoraCache],
-    ) -> torch.Tensor:
-        bsz, seq, _ = x.shape
-        basis = layer(x, t, z, lora_cache).view(
-            bsz, seq, self.heads, self.cfg.func_k
-        ).softmax(dim=-1)
-        return basis.permute(0, 2, 1, 3)
-
-    def _solve_transport(self, mat: torch.Tensor, rhs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
-        mat = torch.nan_to_num(mat, nan=0.0, posinf=1e4, neginf=-1e4)
-        rhs = torch.nan_to_num(rhs, nan=0.0, posinf=1e4, neginf=-1e4)
-        solve_mat = mat.cpu() if mat.device.type == "mps" else mat
-        solve_rhs = rhs.cpu() if rhs.device.type == "mps" else rhs
-        sol, info = torch.linalg.solve_ex(solve_mat, solve_rhs)
-        if info.any():
-            eye = torch.eye(self.cfg.func_k, device=solve_mat.device, dtype=solve_mat.dtype)
-            retry = solve_mat + max(self.cfg.func_lambda, 1.0) * 1e-3 * eye
-            sol, info = torch.linalg.solve_ex(retry, solve_rhs)
-            if info.any():
-                sol = torch.linalg.pinv(retry) @ solve_rhs
-        if mat.device.type == "mps":
-            sol = sol.to(mat.device)
-        return sol.transpose(-1, -2).to(out_dtype)
+    def _split_heads(self, value: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = value.shape
+        return value.reshape(
+            batch, length, self.cfg.heads, self.cfg.head_dim
+        ).transpose(1, 2)
 
     def forward(
         self,
+        stage: str,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        t: int = 0,
-        z: Optional[torch.Tensor] = None,
-        rope_q: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        rope_k: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        lora_cache: Optional[LoraCache] = None,
-    ) -> torch.Tensor:
-        bsz, n_query, _ = query.shape
-        q = _apply_rope(
-            self.q_norm(self._split_heads(self.q_proj(query, t, z, lora_cache))), rope_q
-        )
-        k = _apply_rope(
-            self.k_norm(self._split_heads(self.k_proj(key, t, z, lora_cache))), rope_k
-        )
-        v = self._split_heads(self.v_proj(value, t, z, lora_cache))
-        phi = self._basis(self.phi, query, t, z, lora_cache)
-        psi = self._basis(self.psi, key, t, z, lora_cache)
-        with torch.autocast(device_type=query.device.type, enabled=False):
-            phi_f, psi_f = phi.float(), psi.float()
-            q_t = phi_f.transpose(-1, -2) @ q.float()
-            k_t = psi_f.transpose(-1, -2) @ k.float()
-            v_t = psi_f.transpose(-1, -2) @ v.float()
-            gram = k_t @ k_t.transpose(-1, -2)
-            eye = torch.eye(self.cfg.func_k, device=gram.device, dtype=gram.dtype)
-            gram = gram + self.cfg.func_lambda * eye
-            qk_t = q_t @ k_t.transpose(-1, -2)
-            transport = self._solve_transport(gram, qk_t.transpose(-1, -2), q.dtype)
-        ctx = phi @ (transport @ v_t.to(q.dtype))
-        ctx = ctx.transpose(1, 2).contiguous().view(bsz, n_query, self.dim)
-        return self.out_proj(ctx, t, z, lora_cache)
+        return_weights: bool = False,
+    ):
+        if stage == "compress":
+            query = self.q_proj(query)
+            key = self.k_proj(key)
+            value = self.v_proj(value)
+        elif stage == "refine":
+            pass
+        elif stage == "broadcast":
+            query = self.q_proj(query)
+        else:
+            raise ValueError(f"Unsupported RATS attention stage: {stage}")
 
-
-def _make_attention(cfg: ModelConfig, lora_rank: int) -> nn.Module:
-    if cfg.attention == "softmax":
-        return QKRMSMultiheadAttention(cfg, lora_rank)
-    return FuncAttention(cfg, lora_rank)
+        query = self._split_heads(query)
+        key = self._split_heads(key)
+        value = self._split_heads(value)
+        if return_weights:
+            scores = query @ key.transpose(-2, -1) / self.cfg.head_dim**0.5
+            head_weights = scores.softmax(dim=-1)
+            context = head_weights @ value
+            weights = head_weights.mean(dim=1)
+        else:
+            context_manager = (
+                sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+                if query.device.type == "cuda" and self.cfg.sdpa_backend == "flash"
+                else nullcontext()
+            )
+            with context_manager:
+                context = F.scaled_dot_product_attention(query, key, value)
+            weights = None
+        context = context.transpose(1, 2).contiguous().reshape(
+            query.size(0), query.size(2), self.cfg.dim
+        )
+        output = self.out_proj[stage](context)
+        return (output, weights) if return_weights else output
 
 
 class Block(nn.Module):
-    def __init__(self, cfg: ModelConfig, lora_rank: int = 0, layerscale_steps: int = 1):
+    def __init__(self, cfg: ModelConfig, layerscale_steps: int = 1):
         super().__init__()
         if layerscale_steps < 1:
             raise ValueError("layerscale_steps must be positive")
         self.cfg = cfg
-        self.lnc = _norm(cfg, cfg.dim)
-        self.compress = _make_attention(cfg, lora_rank)
-        self.lnr = _norm(cfg, cfg.dim)
-        self.refine = _make_attention(cfg, lora_rank)
-        self.lnb = _norm(cfg, cfg.dim)
-        self.broadcast = _make_attention(cfg, lora_rank)
+        self.lnp = _norm(cfg, cfg.dim)
+        self.patch_delta = DeltaNet(
+            cfg.dim,
+            cfg.heads,
+            cfg.delta_conv_size,
+            cfg.delta_norm_eps,
+            backend=cfg.delta_backend,
+            chunk_size=cfg.delta_chunk_size,
+        )
         self.lnm = _norm(cfg, cfg.dim)
-        self.w1 = LoraLinear(cfg, cfg.dim, 4 * cfg.dim, lora_rank)
-        self.w2 = LoraLinear(cfg, 4 * cfg.dim, cfg.dim, lora_rank)
+        self.w1 = nn.Linear(cfg.dim, 4 * cfg.dim)
+        self.w2 = nn.Linear(4 * cfg.dim, cfg.dim)
+        self.lnc = _norm(cfg, cfg.dim)
+        self.lnr = _norm(cfg, cfg.dim)
+        self.lnb = _norm(cfg, cfg.dim)
+        if cfg.attention == "rats":
+            self.rats_attention = RATSAttention(cfg)
+        else:
+            self.compress = nn.MultiheadAttention(cfg.dim, cfg.heads, batch_first=True)
+            self.refine = nn.MultiheadAttention(cfg.dim, cfg.heads, batch_first=True)
+            self.broadcast = nn.MultiheadAttention(cfg.dim, cfg.heads, batch_first=True)
         self.gamma_d = nn.Parameter(torch.tensor(cfg.gamma_d))
-        self.drop_path = DropPath(cfg.drop_path) if cfg.drop_path > 0 else nn.Identity()
         if cfg.layerscale:
             # Weight tying applies to the block, not to LayerScale: each
             # iteration gets an independently learnable row.
@@ -409,6 +337,7 @@ class Block(nn.Module):
             self.ls_d = make_scale()
             self.ls_b = make_scale()
             self.ls_m = make_scale()
+            self.ls_p = make_scale()
 
     def _scale(self, name: str, value: torch.Tensor, t: int) -> torch.Tensor:
         if not self.cfg.layerscale:
@@ -418,55 +347,83 @@ class Block(nn.Module):
             scale = scale[t]
         return scale * value
 
-    def _residual(self, name: str, value: torch.Tensor, t: int) -> torch.Tensor:
-        return self.drop_path(self._scale(name, value, t))
-
     def forward(
         self,
         x: torch.Tensor,
         r: torch.Tensor,
         data: bool,
+        n_reg: int,
         t: int = 0,
-        z: Optional[torch.Tensor] = None,
-        rope_p: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        rope_r: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        lora_cache: Optional[LoraCache] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_broadcast_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        x = x + self._scale("ls_p", self.patch_delta(self.lnp(x)), t)
+        if not 1 <= n_reg <= r.size(1):
+            raise ValueError(
+                f"Active register count must be in [1, {r.size(1)}], got {n_reg}"
+            )
+        inactive_r = r[:, n_reg:]
+        r = r[:, :n_reg]
         lx = self.lnc(x)
-        r = r + self._residual(
+        compress_output = (
+            self.rats_attention("compress", self.lnr(r), lx, lx)
+            if self.cfg.attention == "rats"
+            else _softmax_attention(self.cfg, self.compress, self.lnr(r), lx, lx)
+        )
+        r = r + self._scale(
             "ls_c",
-            self.compress(
-                self.lnr(r), lx, lx, t, z, rope_q=rope_r, rope_k=rope_p,
-                lora_cache=lora_cache,
-            ),
+            compress_output,
             t,
         )
-        r = r + self._residual(
+        nr = self.lnr(r)
+        refine_output = (
+            self.rats_attention("refine", nr, nr, nr)
+            if self.cfg.attention == "rats"
+            else _softmax_attention(self.cfg, self.refine, nr, nr, nr)
+        )
+        r = r + self._scale(
             "ls_rf",
-            self.refine(
-                self.lnr(r), self.lnr(r), self.lnr(r), t, z,
-                rope_q=rope_r, rope_k=rope_r, lora_cache=lora_cache,
-            ),
+            refine_output,
             t,
         )
         bx = self.lnb(x)
-        xhat = self.broadcast(
-            bx, self.lnr(r), self.lnr(r), t, z,
-            rope_q=rope_p, rope_k=rope_r, lora_cache=lora_cache,
-        )
+        nr = self.lnr(r)
+        broadcast_weights = None
+        if return_broadcast_weights:
+            if self.cfg.attention == "rats":
+                xhat, scores = self.rats_attention(
+                    "broadcast", bx, nr, nr, return_weights=True
+                )
+            else:
+                xhat, scores = _softmax_attention(
+                    self.cfg, self.broadcast, bx, nr, nr, return_weights=True
+                )
+            broadcast_weights = scores.sum(dim=1)
+            broadcast_weights = broadcast_weights / broadcast_weights.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(torch.finfo(broadcast_weights.dtype).eps)
+        else:
+            xhat = (
+                self.rats_attention("broadcast", bx, nr, nr)
+                if self.cfg.attention == "rats"
+                else _softmax_attention(self.cfg, self.broadcast, bx, nr, nr)
+            )
         eps = bx - xhat
         if data:
-            correction = self.gamma_d * self.compress(
-                self.lnr(r), eps, eps, t, z, rope_q=rope_r, rope_k=rope_p,
-                lora_cache=lora_cache,
+            correction = (
+                self.rats_attention("compress", self.lnr(r), eps, eps)
+                if self.cfg.attention == "rats"
+                else _softmax_attention(
+                    self.cfg, self.compress, self.lnr(r), eps, eps
+                )
             )
-            r = r + self._residual("ls_d", correction, t)
-        x = x + self._residual("ls_b", xhat, t)
-        mlp = self.w2(
-            F.gelu(self.w1(self.lnm(x), t, z, lora_cache)), t, z, lora_cache
+            r = r + self._scale("ls_d", self.gamma_d * correction, t)
+        x = x + self._scale("ls_b", xhat, t)
+        x = x + self._scale(
+            "ls_m", self.w2(F.gelu(self.w1(self.lnm(x)))), t
         )
-        x = x + self._residual("ls_m", mlp, t)
-        return x, r, eps.pow(2).mean()
+        if inactive_r.size(1):
+            r = torch.cat((r, inactive_r), dim=1)
+        return x, r, eps.pow(2).mean(), broadcast_weights
 
 
 class Net(nn.Module):
@@ -476,40 +433,48 @@ class Net(nn.Module):
         self.mode = cfg.mode
         self.data = cfg.mode in DATA_MODES
         self.T = 1 if cfg.mode == "single" else cfg.steps
-        self.use_lora = cfg.lora_rank > 0 and cfg.mode not in {"single", "untied"}
-        self.recur_lora = self.use_lora and cfg.lora_compose == "recur"
-        self.cumul_lora = self.use_lora and cfg.lora_compose == "cumul"
+        self.n_reg_schedule = cfg.n_reg_schedule[: self.T]
         self.patch = nn.Conv2d(3, cfg.dim, cfg.patch_size, cfg.patch_size)
         self.pos = nn.Parameter(torch.randn(1, cfg.num_patches, cfg.dim) * 0.02)
-        self.r0 = nn.Parameter(torch.randn(1, cfg.n_reg, cfg.dim) * 0.02)
-        if cfg.rope:
-            grid = cfg.image_size // cfg.patch_size
-            rope_cos, rope_sin = _build_2d_rope(grid, cfg.head_dim, cfg.rope_base)
-            self.register_buffer("rope_cos", rope_cos)
-            self.register_buffer("rope_sin", rope_sin)
-        if cfg.reg_rope:
-            rrope_cos, rrope_sin = _build_1d_rope(cfg.n_reg, cfg.head_dim, cfg.reg_rope_theta)
-            self.register_buffer("rrope_cos", rrope_cos)
-            self.register_buffer("rrope_sin", rrope_sin)
+        self.r0 = nn.Parameter(torch.randn(1, cfg.max_n_reg, cfg.dim) * 0.02)
         if cfg.mode == "untied":
-            self.blocks = nn.ModuleList([Block(cfg, 0) for _ in range(self.T)])
+            self.blocks = nn.ModuleList([Block(cfg) for _ in range(self.T)])
         else:
-            self.block = Block(
-                cfg,
-                cfg.lora_rank if self.use_lora else 0,
-                layerscale_steps=self.T,
-            )
-        if self.recur_lora:
-            self.z0 = nn.Parameter(torch.randn(cfg.lora_dz) * 0.02)
-            self.projR = nn.Linear(cfg.dim, cfg.lora_dz)
-            self.gru = nn.GRUCell(cfg.lora_dz, cfg.lora_dz)
-        self.head = nn.Sequential(_norm(cfg, cfg.dim), nn.Linear(cfg.dim, cfg.num_classes))
+            self.block = Block(cfg, layerscale_steps=self.T)
+        readout_dim = 2 * cfg.dim if cfg.readout == "concat" else cfg.dim
+        self.head = nn.Sequential(
+            _norm(cfg, readout_dim), nn.Linear(readout_dim, cfg.num_classes)
+        )
 
-    def _rope(self) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        return (self.rope_cos, self.rope_sin) if self.cfg.rope else None
-
-    def _reg_rope(self) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        return (self.rrope_cos, self.rrope_sin) if self.cfg.reg_rope else None
+    def _readout_features(
+        self,
+        x: torch.Tensor,
+        r: torch.Tensor,
+        n_reg: int,
+        broadcast_weights: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        patch_mean = x.mean(1)
+        active_r = r[:, :n_reg]
+        if self.cfg.readout == "weighted":
+            if (
+                broadcast_weights is None
+                or broadcast_weights.shape != active_r.shape[:2]
+            ):
+                raise RuntimeError(
+                    "Weighted readout requires one broadcast weight per active register"
+                )
+            reg_features = (
+                active_r * broadcast_weights.unsqueeze(-1)
+            ).sum(1)
+        else:
+            reg_features = active_r.mean(1)
+        if self.cfg.readout in {"reg", "weighted"}:
+            return reg_features
+        if self.cfg.readout == "patch":
+            return patch_mean
+        if self.cfg.readout == "sum":
+            return 0.5 * (reg_features + patch_mean)
+        return torch.cat((reg_features, patch_mean), dim=-1)
 
     def forward(
         self,
@@ -518,23 +483,34 @@ class Net(nn.Module):
     ) -> tuple[torch.Tensor, list[float], list[torch.Tensor]]:
         x = self.patch(im).flatten(2).transpose(1, 2) + self.pos
         r = self.r0.expand(im.size(0), -1, -1).contiguous()
-        z = self.z0.expand(im.size(0), -1).contiguous() if self.recur_lora else None
-        lora_cache: Optional[LoraCache] = {} if self.cumul_lora else None
-        rope_p, rope_r = self._rope(), self._reg_rope()
         resid: list[float] = []
         recon: list[torch.Tensor] = []
+        readout_weights = None
         for t in range(self.T):
             block = self.blocks[t] if self.mode == "untied" else self.block
-            r_prev = r
-            x, r, eps2 = block(x, r, self.data, t, z, rope_p, rope_r, lora_cache)
+            n_reg = self.n_reg_schedule[t]
+            r_prev = r[:, :n_reg]
+            x, r, eps2, broadcast_weights = block(
+                x,
+                r,
+                self.data,
+                n_reg,
+                t,
+                return_broadcast_weights=(
+                    self.cfg.readout == "weighted" and t == self.T - 1
+                ),
+            )
+            if broadcast_weights is not None:
+                readout_weights = broadcast_weights
             recon.append(eps2)
             if log:
-                numerator = (r - r_prev).norm(dim=-1).mean().item()
-                denominator = r.norm(dim=-1).mean().item() + 1e-8
+                r_active = r[:, :n_reg]
+                numerator = (r_active - r_prev).norm(dim=-1).mean().item()
+                denominator = r_active.norm(dim=-1).mean().item() + 1e-8
                 resid.append(numerator / denominator)
-            if self.recur_lora:
-                z = self.gru(self.projR(r.mean(1)), z)
-        return self.head(r.mean(1)), resid, recon
+        final_n_reg = self.n_reg_schedule[-1]
+        features = self._readout_features(x, r, final_n_reg, readout_weights)
+        return self.head(features), resid, recon
 
 
 class NumericImageFolder(datasets.ImageFolder):
@@ -878,7 +854,6 @@ def training_signature(args, stage: str) -> dict[str, Any]:
     return {
         "stage": stage,
         **{key: getattr(args, key) for key in RESUME_TRAIN_CONFIG_KEYS},
-        "drop_path": args.drop_path,
     }
 
 
@@ -916,7 +891,9 @@ def checkpoint_state(
     rng_by_rank: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "format_version": 1,
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model_family": cfg.model_family,
+        "model_arch": cfg.model_arch,
         "stage": stage,
         "epoch": epoch,
         "num_updates": num_updates,
@@ -982,46 +959,42 @@ def load_checkpoint_file(path: str | Path) -> dict[str, Any]:
     return checkpoint
 
 
-def expand_legacy_layerscale_state(
-    model: nn.Module,
-    state_dict: dict[str, torch.Tensor],
-) -> tuple[dict[str, torch.Tensor], set[str]]:
-    """Expand legacy tied LayerScale vectors into one row per iteration."""
-    target_state = model.state_dict()
-    migrated = state_dict.copy()
-    expanded_names: set[str] = set()
-    for name, target in target_state.items():
-        source = migrated.get(name)
+def validate_checkpoint_compatibility(
+    checkpoint: dict[str, Any],
+    path: str | Path,
+) -> ModelConfig:
+    if checkpoint.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        standalone_config = checkpoint.get("config")
         if (
-            not name.startswith("block.ls_")
-            or source is None
-            or source.ndim + 1 != target.ndim
-            or source.shape != target.shape[1:]
+            isinstance(standalone_config, dict)
+            and standalone_config.get("model_family") == MODEL_FAMILY
         ):
-            continue
-        migrated[name] = source.unsqueeze(0).expand(target.shape).clone()
-        expanded_names.add(name)
-    return migrated, expanded_names
-
-
-def expand_legacy_layerscale_optimizer(
-    optimizer: torch.optim.Optimizer,
-    model: nn.Module,
-    expanded_names: set[str],
-) -> None:
-    """Expand optimizer moments for migrated per-iteration LayerScale tensors."""
-    parameters = dict(model.named_parameters())
-    for name in expanded_names:
-        parameter = parameters[name]
-        for key, value in list(optimizer.state[parameter].items()):
-            if (
-                torch.is_tensor(value)
-                and value.ndim + 1 == parameter.ndim
-                and value.shape == parameter.shape[1:]
-            ):
-                optimizer.state[parameter][key] = (
-                    value.unsqueeze(0).expand(parameter.shape).clone()
-                )
+            kind = "standalone delta_peq.py"
+        else:
+            kind = "legacy or foreign"
+        raise ValueError(
+            f"Checkpoint {path} uses an incompatible {kind} format; expected "
+            f"peq_timm Delta-PEQ format version {CHECKPOINT_FORMAT_VERSION}"
+        )
+    if checkpoint.get("model_family") != MODEL_FAMILY:
+        raise ValueError(
+            f"Checkpoint {path} has model_family={checkpoint.get('model_family')!r}; "
+            f"expected {MODEL_FAMILY!r}"
+        )
+    values = checkpoint.get("model_config")
+    if not isinstance(values, dict):
+        raise ValueError(f"Checkpoint {path} does not contain a valid model_config")
+    missing = set(ModelConfig.__dataclass_fields__) - set(values)
+    if missing:
+        raise ValueError(
+            f"Checkpoint {path} model_config is missing fields: {sorted(missing)}"
+        )
+    cfg = ModelConfig.from_dict(values)
+    if checkpoint.get("model_arch") != cfg.model_arch:
+        raise ValueError(
+            f"Checkpoint {path} architecture metadata does not match model_config"
+        )
+    return cfg
 
 
 def restore_train_config(checkpoint: dict[str, Any], args) -> None:
@@ -1039,7 +1012,7 @@ def restore_train_config(checkpoint: dict[str, Any], args) -> None:
 
 
 def _check_resume(checkpoint: dict[str, Any], args, stage: str, cfg: ModelConfig) -> None:
-    if checkpoint.get("format_version") != 1 or checkpoint.get("stage") != stage:
+    if checkpoint.get("stage") != stage:
         raise ValueError(f"{args.resume} is not a resumable {stage} checkpoint")
     saved_cfg = ModelConfig.from_dict(checkpoint["model_config"])
     if saved_cfg != cfg:
@@ -1054,21 +1027,9 @@ def restore_training_state(
     scheduler,
     loss_scaler: Optional[NativeScaler],
 ) -> tuple[int, int, float]:
-    model_state, expanded_names = expand_legacy_layerscale_state(
-        model, checkpoint["model"]
-    )
-    ema_state, _ = expand_legacy_layerscale_state(
-        model_ema.module, checkpoint["model_ema"]
-    )
-    model.load_state_dict(model_state, strict=True)
-    model_ema.module.load_state_dict(ema_state, strict=True)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model_ema.module.load_state_dict(checkpoint["model_ema"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
-    expand_legacy_layerscale_optimizer(optimizer, model, expanded_names)
-    if expanded_names:
-        LOG.info(
-            "Migrated legacy tied LayerScale checkpoint to per-iteration parameters: %s",
-            sorted(expanded_names),
-        )
     scheduler.load_state_dict(checkpoint["scheduler"])
     if loss_scaler is not None and checkpoint.get("scaler") is not None:
         loss_scaler.load_state_dict(checkpoint["scaler"])
@@ -1109,17 +1070,13 @@ def restore_rng_state(checkpoint: dict[str, Any], args) -> None:
 
 
 def load_initial_weights(model: nn.Module, checkpoint: dict[str, Any]) -> None:
-    state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+    saved_cfg = validate_checkpoint_compatibility(checkpoint, "initial checkpoint")
+    if not isinstance(model, Net) or saved_cfg != model.cfg:
+        raise ValueError("Initial checkpoint model configuration does not match the model")
+    state = checkpoint.get("model")
     if not isinstance(state, dict):
         raise ValueError("Could not locate model weights in initial checkpoint")
-    cleaned = {key.removeprefix("module."): value for key, value in state.items()}
-    migrated, expanded_names = expand_legacy_layerscale_state(model, cleaned)
-    model.load_state_dict(migrated, strict=True)
-    if expanded_names:
-        LOG.info(
-            "Migrated legacy tied LayerScale weights to per-iteration parameters: %s",
-            sorted(expanded_names),
-        )
+    model.load_state_dict(state, strict=True)
 
 
 def _wandb_config(args, cfg: ModelConfig, stage: str) -> dict[str, Any]:
@@ -1223,29 +1180,20 @@ def config_from_args(args, num_classes: int) -> ModelConfig:
         image_size=args.image_size,
         patch_size=args.patch_size,
         dim=args.dim,
-        n_reg=args.n_reg,
+        n_reg_schedule=args.n_reg,
         heads=args.heads,
         steps=args.steps,
         num_classes=num_classes,
         mode=args.mode,
         attention=args.attention,
-        func_k=args.func_k,
-        func_lambda=args.func_lambda,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha if args.lora_alpha is not None else (args.lora_rank or 1.0),
-        lora_compose=args.lora_compose,
-        lora_dz=args.lora_dz,
+        sdpa_backend=args.sdpa_backend,
+        delta_backend=args.delta_backend,
+        delta_chunk_size=args.delta_chunk_size,
+        readout=args.readout,
         rmsnorm=args.rmsnorm,
         layerscale=args.layerscale,
         layerscale_init=args.layerscale_init,
-        qk_rms_norm=args.qk_rms_norm,
-        qk_rms_eps=args.qk_rms_eps,
-        rope=args.rope,
-        rope_base=args.rope_base,
-        reg_rope=args.reg_rope,
-        reg_rope_theta=args.reg_rope_theta,
         gamma_d=args.gamma_d,
-        drop_path=args.drop_path,
     )
 
 
@@ -1254,28 +1202,29 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--dim", type=int, default=384)
-    parser.add_argument("--n-reg", type=int, default=8)
+    parser.add_argument("--n-reg", type=parse_n_reg_schedule, default=(8,))
     parser.add_argument("--heads", type=int, default=6)
     parser.add_argument("--steps", type=int, default=4)
-    parser.add_argument("--attention", choices=("softmax", "funcattn"), default="softmax")
-    parser.add_argument("--func-k", type=int, default=64)
-    parser.add_argument("--func-lambda", type=float, default=1.0)
-    parser.add_argument("--lora-rank", type=int, default=0)
-    parser.add_argument("--lora-alpha", type=float, default=None)
-    parser.add_argument("--lora-compose", choices=("indep", "cumul", "recur"), default="indep")
-    parser.add_argument("--lora-dz", type=int, default=64)
+    parser.add_argument(
+        "--attention", choices=("sequential", "rats"), default="sequential"
+    )
+    parser.add_argument("--sdpa-backend", choices=("flash", "auto"), default="flash")
+    parser.add_argument(
+        "--delta-backend", choices=sorted(DELTA_BACKENDS), default="auto"
+    )
+    parser.add_argument(
+        "--delta-chunk-size", type=int, choices=(16, 32, 64), default=64
+    )
+    parser.add_argument(
+        "--readout",
+        choices=("reg", "weighted", "patch", "sum", "concat"),
+        default="reg",
+    )
     parser.add_argument("--rmsnorm", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--layerscale", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--layerscale-init", type=float, default=1e-4)
-    parser.add_argument("--qk-rms-norm", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--qk-rms-eps", type=float, default=1e-6)
-    parser.add_argument("--rope", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--rope-base", type=float, default=100.0)
-    parser.add_argument("--reg-rope", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--reg-rope-theta", type=float, default=10000.0)
     parser.add_argument("--gamma-d", type=float, default=0.5)
     parser.add_argument("--lrec", type=float, default=0.3)
-    parser.add_argument("--drop-path", type=float, default=0.05)
 
 
 def create_stage_parser(stage: str) -> argparse.ArgumentParser:
@@ -1372,45 +1321,85 @@ def apply_model_config(args, cfg: ModelConfig) -> None:
         "image_size": "image_size",
         "patch_size": "patch_size",
         "dim": "dim",
-        "n_reg": "n_reg",
+        "n_reg_schedule": "n_reg",
         "heads": "heads",
         "steps": "steps",
         "mode": "mode",
         "attention": "attention",
-        "func_k": "func_k",
-        "func_lambda": "func_lambda",
-        "lora_rank": "lora_rank",
-        "lora_alpha": "lora_alpha",
-        "lora_compose": "lora_compose",
-        "lora_dz": "lora_dz",
+        "sdpa_backend": "sdpa_backend",
+        "delta_backend": "delta_backend",
+        "delta_chunk_size": "delta_chunk_size",
+        "readout": "readout",
         "rmsnorm": "rmsnorm",
         "layerscale": "layerscale",
         "layerscale_init": "layerscale_init",
-        "qk_rms_norm": "qk_rms_norm",
-        "qk_rms_eps": "qk_rms_eps",
-        "rope": "rope",
-        "rope_base": "rope_base",
-        "reg_rope": "reg_rope",
-        "reg_rope_theta": "reg_rope_theta",
         "gamma_d": "gamma_d",
-        "drop_path": "drop_path",
     }
     for config_name, argument_name in mapping.items():
         setattr(args, argument_name, getattr(cfg, config_name))
 
 
-def run_name_suffix(args, cfg: ModelConfig) -> str:
+def model_name_suffix(cfg: ModelConfig) -> str:
     return (
-        f"lr{args.lr:g}_epoch{args.epochs}_BS{args.batch_size * args.world_size * args.grad_accum_steps}"
-        f"_img{cfg.image_size}_D{cfg.dim}_T{cfg.steps}"
-        f"_nreg{cfg.n_reg}_lorarank{cfg.lora_rank}"
+        f"{cfg.mode}_{cfg.attention}"
+        f"_delta{cfg.delta_backend}_sdpa{cfg.sdpa_backend}_c{cfg.delta_chunk_size}"
+        f"_ro{cfg.readout}_img{cfg.image_size}_p{cfg.patch_size}"
+        f"_D{cfg.dim}_H{cfg.heads}_T{cfg.steps}_N{cfg.n_reg_label}"
+        f"_rms{int(cfg.rmsnorm)}_LS{int(cfg.layerscale)}x{cfg.layerscale_init:g}"
+        f"_g{cfg.gamma_d:g}"
     )
+
+
+def training_name_suffix(args) -> str:
+    amp_label = args.amp_dtype if args.amp else "off"
+    return (
+        f"s{args.seed}_lrec{args.lrec:g}"
+        f"_opt{args.opt}_lr{args.lr:g}_minlr{args.min_lr:g}_wd{args.weight_decay:g}"
+        f"_ep{args.epochs}_wu{args.warmup_epochs}"
+        f"_bs{args.batch_size}_gpu{args.world_size}_acc{args.grad_accum_steps}"
+        f"_amp{amp_label}"
+    )
+
+
+def run_name_suffix(args, cfg: ModelConfig) -> str:
+    return f"{model_name_suffix(cfg)}_{training_name_suffix(args)}"
 
 
 def append_run_suffix(value: str | Path, suffix: str) -> str:
     value = str(value)
     full_suffix = f"_{suffix}"
     return value if value.endswith(full_suffix) else value + full_suffix
+
+
+def wandb_project_name(
+    base: str,
+    cfg: ModelConfig,
+) -> str:
+    """Build a model-only W&B project name under its 128-character limit."""
+    project = append_run_suffix(base, model_name_suffix(cfg))
+    if len(project) > 128:
+        raise ValueError(
+            f"Model-derived wandb-project name is {len(project)} characters; "
+            "W&B allows at most 128. Use a shorter --wandb-project base name "
+            "or a more compact register schedule."
+        )
+    return project
+
+
+def validate_model_runtime(args, cfg: ModelConfig) -> None:
+    explicit_fla = cfg.delta_backend in {"fla", "chunk", "fused_recurrent"}
+    if explicit_fla:
+        require_fla()
+        if args.device.type != "cuda":
+            raise RuntimeError(f"delta_backend={cfg.delta_backend} requires CUDA")
+    if cfg.delta_backend in {"fla", "chunk"} and not args.amp:
+        raise ValueError(f"delta_backend={cfg.delta_backend} requires --amp")
+    if (
+        args.device.type == "cuda"
+        and cfg.sdpa_backend == "flash"
+        and not torch.backends.cuda.is_flash_attention_available()
+    ):
+        raise RuntimeError("sdpa_backend=flash but PyTorch Flash SDPA is unavailable")
 
 
 def finalize_run_destinations(
@@ -1429,10 +1418,14 @@ def finalize_run_destinations(
             args.wandb_project = saved_project
         return
 
-    suffix = run_name_suffix(args, cfg)
+    model_suffix = model_name_suffix(cfg)
+    training_suffix = training_name_suffix(args)
+    suffix = f"{model_suffix}_{training_suffix}"
     output_base = args.output_dir or f"outputs/peq_timm/{stage}/{cfg.mode}_seed{args.seed}"
     args.output_dir = append_run_suffix(output_base, suffix)
-    args.wandb_project = append_run_suffix(args.wandb_project, suffix)
+    args.wandb_project = wandb_project_name(args.wandb_project, cfg)
+    wandb_name_base = args.wandb_name or stage
+    args.wandb_name = append_run_suffix(wandb_name_base, training_suffix)
 
 
 def run_stage(args, stage: str) -> None:
@@ -1450,6 +1443,11 @@ def run_stage(args, stage: str) -> None:
 
     source = args.resume or (args.pretrained_checkpoint if stage == "finetune" else "")
     source_checkpoint = load_checkpoint_file(source) if source else None
+    provisional_cfg = (
+        validate_checkpoint_compatibility(source_checkpoint, source)
+        if source_checkpoint is not None
+        else None
+    )
     if args.resume:
         assert source_checkpoint is not None
         restore_train_config(source_checkpoint, args)
@@ -1468,10 +1466,7 @@ def run_stage(args, stage: str) -> None:
                 args.aa,
                 args.reprob,
             )
-    if source_checkpoint is not None:
-        if "model_config" not in source_checkpoint:
-            raise ValueError(f"Checkpoint {source} does not contain model_config")
-        provisional_cfg = ModelConfig.from_dict(source_checkpoint["model_config"])
+    if provisional_cfg is not None:
         apply_model_config(args, provisional_cfg)
     else:
         provisional_cfg = config_from_args(args, num_classes=1000)
@@ -1480,6 +1475,7 @@ def run_stage(args, stage: str) -> None:
         args.amp = False
     if args.grad_accum_steps < 1:
         raise ValueError("grad_accum_steps must be at least 1")
+    validate_model_runtime(args, provisional_cfg)
     if args.smoke:
         args.epochs = min(args.epochs, 1)
         args.limit_train = args.limit_train or max(
@@ -1523,16 +1519,7 @@ def run_stage(args, stage: str) -> None:
     if stage == "finetune" and not args.resume:
         if source_checkpoint is None or "model_ema" not in source_checkpoint:
             raise ValueError("Pretraining checkpoint does not contain model_ema")
-        pretrained_state, expanded_names = expand_legacy_layerscale_state(
-            model, source_checkpoint["model_ema"]
-        )
-        model.load_state_dict(pretrained_state, strict=True)
-        if expanded_names:
-            LOG.info(
-                "Migrated legacy tied LayerScale pretraining weights to "
-                "per-iteration parameters: %s",
-                sorted(expanded_names),
-            )
+        model.load_state_dict(source_checkpoint["model_ema"], strict=True)
 
     optimizer = create_optimizer_v2(
         model,

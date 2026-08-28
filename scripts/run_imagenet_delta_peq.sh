@@ -22,7 +22,8 @@ export IMG="${IMG:-224}"
 export RESIZE="${RESIZE:-256}"
 export D="${D:-384}"
 export N_REG="${N_REG:-64}"  # 16,16,24,24,32,32,48,48,64,64,64,64 or 64
-export ATTN="${ATTN:-sequential}"  # sequential or rats
+export DELTAREG="${DELTAREG:-0}"
+export ATTN="${ATTN:-rats}"  # sequential or rats
 if [[ "${ATTN}" != "sequential" && "${ATTN}" != "rats" ]]; then
     echo "Unsupported ATTN=${ATTN}; use sequential or rats" >&2
     exit 1
@@ -76,7 +77,7 @@ export GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 export REQUIRE_CUDA="${REQUIRE_CUDA:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_delta_peq_patch${PATCH_ATTN}_${STAGE_LAYOUT}_refine${REFINE_ATTN}_${DELTA_BACKEND_LABEL}_sdpa${SDPA_BACKEND_LABEL}_c${DELTA_CHUNK_SIZE}_readout${READOUT}_midout${MIDOUT}_D${D}_NREG${N_REG_LABEL}_T${T}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_rms${RMSNORM}_LS${LAYERSCALE}_lr${MAX_LR}_minlr${MIN_LR}}"
+export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_deltareg${DELTAREG}_delta_peq_patch${PATCH_ATTN}_${STAGE_LAYOUT}_refine${REFINE_ATTN}_${DELTA_BACKEND_LABEL}_sdpa${SDPA_BACKEND_LABEL}_c${DELTA_CHUNK_SIZE}_readout${READOUT}_midout${MIDOUT}_D${D}_NREG${N_REG_LABEL}_T${T}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_rms${RMSNORM}_LS${LAYERSCALE}_lr${MAX_LR}_minlr${MIN_LR}}"
 export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2
@@ -116,6 +117,7 @@ echo "output_dir=${OUTPUT_DIR}"
 if [[ "${GPUS_PER_NODE}" -gt 1 ]]; then
     "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \
+        --local_addr=127.0.0.1 \
         --nnodes=1 \
         --nproc_per_node="${GPUS_PER_NODE}" \
         delta_peq.py

@@ -1,0 +1,107 @@
+{
+  "os":  "Linux-5.15.0-139-generic-x86_64-with-glibc2.31",
+  "python":  "CPython 3.11.16",
+  "startedAt":  "2026-08-26T16:38:30.609209Z",
+  "args":  [
+    "--data-root",
+    "/cis/project/peq_project/imagenet-1k",
+    "--output-dir",
+    "outputs/peq_timm/pretrain",
+    "--mode",
+    "tied",
+    "--seed",
+    "0",
+    "--lr",
+    "1e-3",
+    "--batch-size",
+    "256",
+    "--grad-accum-steps",
+    "1",
+    "--workers",
+    "16",
+    "--epochs",
+    "400",
+    "--weight-decay",
+    "0.03",
+    "--steps",
+    "12",
+    "--n-reg",
+    "64",
+    "--attention",
+    "rats",
+    "--sdpa-backend",
+    "flash",
+    "--delta-backend",
+    "fla",
+    "--delta-chunk-size",
+    "64",
+    "--readout",
+    "reg",
+    "--wandb-project",
+    "peq_imagenet_pretrain",
+    "--wandb-entity",
+    "",
+    "--wandb-name",
+    "pretrain",
+    "--wandb-group",
+    "",
+    "--wandb-dir",
+    "wandb/pretrain"
+  ],
+  "program":  "/cis/home/cyang140/new_Archive/imagenet_peq_timm_pretrain.py",
+  "codePath":  "imagenet_peq_timm_pretrain.py",
+  "codePathLocal":  "imagenet_peq_timm_pretrain.py",
+  "git":  {
+    "remote":  "https://github.com/LouisCroix/new_Archive.git",
+    "commit":  "664b5fc0a058aa6bd4afdcf138b00325fb0c206b"
+  },
+  "email":  "yang131072@gmail.com",
+  "root":  "wandb/pretrain",
+  "host":  "r18",
+  "executable":  "/cis/home/cyang140/.conda/envs/peq-fla/bin/python",
+  "cpu_count":  24,
+  "cpu_count_logical":  48,
+  "gpu":  "NVIDIA RTX A5000",
+  "gpu_count":  4,
+  "disk":  {
+    "/":  {
+      "total":  "1967317549056",
+      "used":  "726850555904"
+    }
+  },
+  "memory":  {
+    "total":  "270089719808"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA RTX A5000",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  8192,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-7fed6af1-ca67-87b5-c46a-3a900653d3f3"
+    },
+    {
+      "name":  "NVIDIA RTX A5000",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  8192,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-25a0bd34-129d-312f-7649-19547ed69dad"
+    },
+    {
+      "name":  "NVIDIA RTX A5000",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  8192,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-ff128465-f30e-65a8-f706-8fcd5eff017b"
+    },
+    {
+      "name":  "NVIDIA RTX A5000",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  8192,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-30345357-7601-22cf-4e95-a937e5b3da85"
+    }
+  ],
+  "cudaVersion":  "12.8",
+  "writerId":  "roz46995q6vvyefk398sgskqvg58ax2k"
+}

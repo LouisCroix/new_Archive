@@ -1,12 +1,16 @@
 """
 Patch-DeltaNet PEQ on ImageNet-1K with the DATA TERM and multi-seed error bars.
 
-Each block first applies a patch DeltaNet residual, followed by the PEQ register
-stages. ATTN=sequential uses independent softmax attention in each register
-stage. ATTN=rats shares Wq/Wk/Wv across the three stages and bypasses register
-projections in refine and broadcast.
+Each block first applies a DeltaNet residual, followed by the PEQ register stages.
+By default (DELTAREG=0), DeltaNet processes patches only. With DELTAREG=1, all
+registers active at the current iteration are appended after the patches and the
+joint sequence is processed by the same DeltaNet parameters. ATTN=sequential
+uses independent softmax attention in each register stage. ATTN=rats shares
+Wq/Wk/Wv across the three stages and bypasses register projections in refine and
+broadcast.
 
-  x = x + patch_delta(norm(x))
+  x = x + patch_delta(norm(x))                         # DELTAREG=0
+  [x, r] = [x, r] + patch_delta(norm([x, r]))          # DELTAREG=1
   r = r + compress(norm(r), norm(x), norm(x))
   r = r + refine(norm(r))
   x = x + broadcast(norm(x), norm(r), norm(r))
@@ -121,6 +125,8 @@ if RESUME:
     if resume_config.get("model_arch") not in {
         "sequential_patch_delta_softmax_stages_v1",
         "rats_patch_delta_shared_qkv_identity_registers_v1",
+        "sequential_patch_register_delta_softmax_stages_v1",
+        "rats_patch_register_delta_shared_qkv_identity_registers_v1",
     }:
         raise ValueError(
             "Only sequential and RATS Delta-PEQ checkpoints are supported: "
@@ -133,6 +139,7 @@ if RESUME:
         "SDPA_BACKEND": "sdpa_backend",
         "DELTA_BACKEND": "delta_backend",
         "DELTA_CHUNK_SIZE": "delta_chunk_size",
+        "DELTAREG": "deltareg",
         "READOUT": "readout",
         "MIDOUT": "midout",
         "RMSNORM": "rmsnorm",
@@ -224,6 +231,12 @@ MIDOUT_WEIGHT = 0.5
 RMSNORM = env_flag("RMSNORM", 0)
 LAYERSCALE = env_flag("LAYERSCALE", 0)
 LS_INIT = float(os.environ.get("LS_INIT", 1e-4))
+try:
+    DELTAREG = int(os.environ.get("DELTAREG", 0))
+except ValueError as exc:
+    raise ValueError("DELTAREG must be 0 or 1") from exc
+if DELTAREG not in {0, 1}:
+    raise ValueError(f"DELTAREG={DELTAREG} must be 0 or 1")
 DELTA_CONV_SIZE = 4
 DELTA_NORM_EPS = 1e-5
 DELTA_BACKEND = os.environ.get("DELTA_BACKEND", "auto").lower()
@@ -246,7 +259,7 @@ if (
     and not torch.backends.cuda.is_flash_attention_available()
 ):
     raise RuntimeError("SDPA_BACKEND=flash but PyTorch Flash SDPA is unavailable")
-PATCH_ATTN = "standard_delta"
+PATCH_ATTN = "standard_delta_patch_register" if DELTAREG else "standard_delta"
 STAGE_LAYOUT = ATTN
 if ATTN == "rats":
     COMPRESS_ATTN = "rats_shared_qkv"
@@ -258,11 +271,18 @@ else:
     BROADCAST_ATTN = "softmax"
 DELTA_BACKEND_LABEL = DELTA_BACKEND
 SDPA_BACKEND_LABEL = SDPA_BACKEND
-MODEL_ARCH = (
-    "rats_patch_delta_shared_qkv_identity_registers_v1"
-    if ATTN == "rats"
-    else "sequential_patch_delta_softmax_stages_v1"
-)
+if DELTAREG:
+    MODEL_ARCH = (
+        "rats_patch_register_delta_shared_qkv_identity_registers_v1"
+        if ATTN == "rats"
+        else "sequential_patch_register_delta_softmax_stages_v1"
+    )
+else:
+    MODEL_ARCH = (
+        "rats_patch_delta_shared_qkv_identity_registers_v1"
+        if ATTN == "rats"
+        else "sequential_patch_delta_softmax_stages_v1"
+    )
 if DELTA_BACKEND not in DELTA_BACKENDS:
     options = ", ".join(sorted(DELTA_BACKENDS))
     raise ValueError(f"Unsupported DELTA_BACKEND={DELTA_BACKEND}; use {options}")
@@ -284,9 +304,10 @@ MODES = os.environ.get("MODES", "single,tied,untied,tied_data,tied_data_rec").sp
 SEEDS = [int(s) for s in os.environ.get("SEEDS", "0,1,2").split(",")]
 LIMIT_TRAIN = int(os.environ.get("LIMIT_TRAIN", 0))
 LIMIT_VAL = int(os.environ.get("LIMIT_VAL", 0))
+DELTAREG_OUTPUT_SUFFIX = "_dreg1" if DELTAREG else ""
 OUTPUT_DIR = os.environ.get(
     "OUTPUT_DIR",
-    f"outputs/imagenet_delta_peq_patchdelta_{STAGE_LAYOUT}_refine{REFINE_ATTN}_{DELTA_BACKEND_LABEL}_sdpa{SDPA_BACKEND_LABEL}_c{DELTA_CHUNK_SIZE}_D{D}_NREG{N_REG_LABEL}_T{T}_img{IMG}_readout{READOUT}_midout{MIDOUT}",
+    f"outputs/imagenet_delta_peq_patchdelta{DELTAREG_OUTPUT_SUFFIX}_{STAGE_LAYOUT}_refine{REFINE_ATTN}_{DELTA_BACKEND_LABEL}_sdpa{SDPA_BACKEND_LABEL}_c{DELTA_CHUNK_SIZE}_D{D}_NREG{N_REG_LABEL}_T{T}_img{IMG}_readout{READOUT}_midout{MIDOUT}",
 )
 if resume_checkpoint is not None:
     saved_mode = resume_checkpoint.get("mode", resume_config.get("mode"))
@@ -398,6 +419,7 @@ def run_config(mode, seed, nparam):
         "broadcast_attention": BROADCAST_ATTN,
         "delta_backend": DELTA_BACKEND,
         "delta_chunk_size": DELTA_CHUNK_SIZE,
+        "deltareg": DELTAREG,
         "delta_conv_size": DELTA_CONV_SIZE,
         "delta_norm_eps": DELTA_NORM_EPS,
         "readout": READOUT,
@@ -595,7 +617,7 @@ def validate_resume_checkpoint(checkpoint, mode, seed, nparam, expanded_layersca
         "model_family", "model_arch", "img", "resize", "patch", "dim", "n_reg",
         "n_reg_schedule", "max_n_reg", "heads",
         "attn", "stage_layout", "sdpa_backend", "patch_attention", "compress_attention", "refine_attention",
-        "broadcast_attention", "delta_backend", "delta_chunk_size", "delta_conv_size",
+        "broadcast_attention", "delta_backend", "delta_chunk_size", "deltareg", "delta_conv_size",
         "delta_norm_eps", "readout", "midout", "midout_weight", "midout_iteration",
         "rmsnorm", "layerscale", "layerscale_layout",
         "ls_init", "T", "epochs",
@@ -785,15 +807,33 @@ class Block(nn.Module):
         return scale * value
 
     def forward(self, x, r, data, n_reg, t=0, return_broadcast_weights=False):
-        nx = self.lnp(x)
-        patch_output = self.patch_delta(nx)
         if not 1 <= n_reg <= r.size(1):
             raise ValueError(
                 f"Active register count must be in [1, {r.size(1)}], got {n_reg}"
             )
         inactive_r = r[:, n_reg:]
         r = r[:, :n_reg]
-        x = x + self._scale("ls_p", patch_output, t)
+        if DELTAREG:
+            # Registers follow patches so the causal DeltaNet treats the active
+            # registers as additional tokens conditioned on the full patch
+            # sequence. The same norm, DeltaNet, and LayerScale parameters are
+            # shared by both token types; inactive registers remain untouched.
+            delta_tokens = torch.cat((x, r), dim=1)
+            delta_output = self._scale(
+                "ls_p",
+                self.patch_delta(self.lnp(delta_tokens)),
+                t,
+            )
+            patch_output, register_output = delta_output.split(
+                (x.size(1), n_reg), dim=1
+            )
+            x = x + patch_output
+            r = r + register_output
+        else:
+            # Preserve the original patch-only DeltaNet path exactly.
+            nx = self.lnp(x)
+            patch_output = self.patch_delta(nx)
+            x = x + self._scale("ls_p", patch_output, t)
         lx = self.lnc(x)
         compress_output = (
             self.rats_attention("compress", self.lnr(r), lx, lx)
@@ -1213,7 +1253,7 @@ log(
     f"compress_attn={COMPRESS_ATTN}  refine_attn={REFINE_ATTN}  "
     f"broadcast_attn={BROADCAST_ATTN}  readout={READOUT}  midout={MIDOUT}  "
     f"delta_backend={DELTA_BACKEND_LABEL}  sdpa_backend={SDPA_BACKEND_LABEL}  "
-    f"delta_chunk_size={DELTA_CHUNK_SIZE}  "
+    f"delta_chunk_size={DELTA_CHUNK_SIZE}  deltareg={DELTAREG}  "
     f"delta_conv_size={DELTA_CONV_SIZE}  "
     f"delta_norm_eps={DELTA_NORM_EPS:g}"
 )

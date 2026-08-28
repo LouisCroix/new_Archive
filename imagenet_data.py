@@ -39,6 +39,7 @@ def make_imagenet_loaders(
     rank=0,
     world_size=1,
     persistent_workers=True,
+    timeout=0,
 ):
     data_root = Path(data_root)
     train_dir = data_root / "train"
@@ -73,6 +74,10 @@ def make_imagenet_loaders(
         num_workers=workers,
         pin_memory=pin,
         persistent_workers=persistent_workers and workers > 0,
+        # A positive timeout requires multiprocessing.  Keeping this configurable
+        # lets distributed jobs fail fast when one NFS-backed loader rank stalls
+        # instead of leaving the other ranks blocked in an NCCL collective.
+        timeout=timeout if workers > 0 else 0,
     )
     train_sampler = DistributedSampler(
         train_ds, num_replicas=world_size, rank=rank, shuffle=True
