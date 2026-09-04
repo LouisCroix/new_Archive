@@ -17,3 +17,47 @@ config: {'stage': 'pretrain', 'model': {'image_size': 224, 'patch_size': 16, 'di
 2026-08-26 12:38:32,680 INFO    MainThread:3742698 [wandb_run.py:_redirect():2540] Wrapping output streams.
 2026-08-26 12:38:32,680 INFO    MainThread:3742698 [wandb_run.py:_redirect():2563] Redirects installed.
 2026-08-26 12:38:32,717 INFO    MainThread:3742698 [wandb_init.py:init():1016] run started, returning control to user process
+2026-09-01 01:52:41,027 INFO    wandb-AsyncioManager-main:3742698 [service_client.py:_forward_responses():122] [no run ID] Reached EOF.
+2026-09-01 01:52:41,027 INFO    wandb-AsyncioManager-main:3742698 [mailbox.py:close():154] [no run ID] Closing mailbox, abandoning 2 handles.
+2026-09-01 01:52:41,028 ERROR   wandb-AsyncioManager-main:3742698 [asyncio_manager.py:fn_wrap_exceptions():197] Uncaught exception in run_soon callback.
+Traceback (most recent call last):
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/asyncio_manager.py", line 195, in fn_wrap_exceptions
+    await fn()
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/run_messages.py", line 90, in loop
+    await asyncio_compat.race(
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/asyncio_compat.py", line 279, in race
+    async with open_task_group(race=True) as tg:
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/asyncio_compat.py", line 241, in open_task_group
+    await task_group._wait_all(race=race, timeout=exit_timeout)
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/asyncio_compat.py", line 181, in _wait_all
+    raise exc
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/run_messages.py", line 113, in _print_all
+    result = await handle.wait_async(timeout=None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/mailbox/mailbox_handle.py", line 127, in wait_async
+    response = await self._handle.wait_async(timeout=timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/mailbox/response_handle.py", line 123, in wait_async
+    raise HandleAbandonedError()
+wandb.sdk.mailbox.mailbox_handle.HandleAbandonedError
+2026-09-01 01:52:53,381 ERROR   wandb-AsyncioManager-main:3742698 [asyncio_manager.py:fn_wrap_exceptions():197] Uncaught exception in run_soon callback.
+Traceback (most recent call last):
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/asyncio_manager.py", line 195, in fn_wrap_exceptions
+    await fn()
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/run_stopping.py", line 87, in loop
+    should_stop = await self._check_should_stop()
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/run_stopping.py", line 115, in _check_should_stop
+    handle = await self._interface.deliver_async(request)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/interface/interface_sock.py", line 58, in deliver_async
+    handle = await self._client.deliver(request)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/lib/service/service_client.py", line 57, in deliver
+    handle = self._mailbox.require_response(request)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cis/home/cyang140/.conda/envs/peq-fla/lib/python3.11/site-packages/wandb/sdk/mailbox/mailbox.py", line 89, in require_response
+    raise MailboxClosedError()
+wandb.sdk.mailbox.mailbox.MailboxClosedError

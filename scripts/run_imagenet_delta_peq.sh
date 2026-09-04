@@ -23,7 +23,7 @@ export RESIZE="${RESIZE:-256}"
 export D="${D:-384}"
 export N_REG="${N_REG:-64}"  # 16,16,24,24,32,32,48,48,64,64,64,64 or 64
 export DELTAREG="${DELTAREG:-0}"
-export ATTN="${ATTN:-rats}"  # sequential or rats
+export ATTN="${ATTN:-sequential}"  # sequential or rats
 if [[ "${ATTN}" != "sequential" && "${ATTN}" != "rats" ]]; then
     echo "Unsupported ATTN=${ATTN}; use sequential or rats" >&2
     exit 1
@@ -61,6 +61,11 @@ export WORKERS="${WORKERS:-4}"
 export EPOCHS="${EPOCHS:-22}"
 export WARMUP_EPOCHS="${WARMUP_EPOCHS:-2}"
 export T="${T:-12}"
+export SKIPATTN="${SKIPATTN:-2}"  # attention on 1-based iterations divisible by SKIPATTN
+if ! [[ "${SKIPATTN}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SKIPATTN=${SKIPATTN} must be a positive integer" >&2
+    exit 1
+fi
 N_REG_LABEL="${N_REG//,/x}"
 N_REG_LABEL="${N_REG_LABEL// /}"
 N_REG_LABEL="${N_REG_LABEL//\[/}"
@@ -77,7 +82,7 @@ export GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 export REQUIRE_CUDA="${REQUIRE_CUDA:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_deltareg${DELTAREG}_delta_peq_patch${PATCH_ATTN}_${STAGE_LAYOUT}_refine${REFINE_ATTN}_${DELTA_BACKEND_LABEL}_sdpa${SDPA_BACKEND_LABEL}_c${DELTA_CHUNK_SIZE}_readout${READOUT}_midout${MIDOUT}_D${D}_NREG${N_REG_LABEL}_T${T}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_rms${RMSNORM}_LS${LAYERSCALE}_lr${MAX_LR}_minlr${MIN_LR}}"
+export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_deltareg${DELTAREG}_delta_peq_patch${PATCH_ATTN}_${STAGE_LAYOUT}_refine${REFINE_ATTN}_${DELTA_BACKEND_LABEL}_sdpa${SDPA_BACKEND_LABEL}_c${DELTA_CHUNK_SIZE}_skipattn${SKIPATTN}_readout${READOUT}_midout${MIDOUT}_D${D}_NREG${N_REG_LABEL}_T${T}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_rms${RMSNORM}_LS${LAYERSCALE}_lr${MAX_LR}_minlr${MIN_LR}}"
 export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2
@@ -108,7 +113,7 @@ echo "python_bin=${PYTHON_BIN}"
 echo "triton_cache_dir=${TRITON_CACHE_DIR}"
 echo "stage_layout=${STAGE_LAYOUT} patch_attn=${PATCH_ATTN} compress_attn=${COMPRESS_ATTN} refine_attn=${REFINE_ATTN} broadcast_attn=${BROADCAST_ATTN}"
 echo "delta_backend=${DELTA_BACKEND_LABEL} sdpa_backend=${SDPA_BACKEND_LABEL} delta_chunk_size=${DELTA_CHUNK_SIZE} readout=${READOUT} midout=${MIDOUT}"
-echo "n_reg=${N_REG} T=${T}"
+echo "n_reg=${N_REG} T=${T} skipattn=${SKIPATTN}"
 echo "epochs=${EPOCHS} warmup_epochs=${WARMUP_EPOCHS} grad_accum_steps=${GRAD_ACCUM_STEPS}"
 echo "memory_probe=${MEMORY_PROBE}"
 echo "max_lr=${MAX_LR} min_lr=${MIN_LR}"

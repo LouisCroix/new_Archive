@@ -11,7 +11,7 @@
 BS=128 ATTN=sequential CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 bash scripts/run_imagenet_delta_peq.sh
 
 # cnn run
-BS=128 CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 bash scripts/run_imagenet_recurrent_cnn.sh
+REG_HEAD=0 BS=128 GRAD_ACCUM_STEPS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 bash scripts/run_imagenet_recurrent_cnn.sh
 
 # timm pretrain
 CUDA_VISIBLE_DEVICES=0,1 GPUS_PER_NODE=2 bash scripts/run_peq_timm_pretrain.sh
@@ -27,3 +27,6 @@ CUDA_VISIBLE_DEVICES=0,1 \
 GPUS_PER_NODE=2 \
 bash scripts/run_peq_timm_finetune.sh \
 /绝对路径/checkpoint_final.pt
+
+# official convnext
+EPOCHS=100 WARMUP_EPOCHS=5 bash scripts/run_imagenet_recurrent_cnn_official.sh

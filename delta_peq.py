@@ -1,13 +1,15 @@
 """
 Patch-DeltaNet PEQ on ImageNet-1K with the DATA TERM and multi-seed error bars.
 
-Each block first applies a DeltaNet residual, followed by the PEQ register stages.
-By default (DELTAREG=0), DeltaNet processes patches only. With DELTAREG=1, all
-registers active at the current iteration are appended after the patches and the
-joint sequence is processed by the same DeltaNet parameters. ATTN=sequential
-uses independent softmax attention in each register stage. ATTN=rats shares
-Wq/Wk/Wv across the three stages and bypasses register projections in refine and
-broadcast.
+Each block first applies a DeltaNet residual. Every SKIPATTN-th iteration then
+applies the PEQ register stages and MLP; other iterations stop after DeltaNet.
+Iterations are counted from one, so SKIPATTN=1 preserves the original model and
+SKIPATTN=2 enables the register stages on iterations 2, 4, 6, ... . By default
+(DELTAREG=0), DeltaNet processes patches only. With DELTAREG=1, all registers
+active at the current iteration are appended after the patches and the joint
+sequence is processed by the same DeltaNet parameters. ATTN=sequential uses
+independent softmax attention in each register stage. ATTN=rats shares Wq/Wk/Wv
+across the three stages and bypasses register projections in refine and broadcast.
 
   x = x + patch_delta(norm(x))                         # DELTAREG=0
   [x, r] = [x, r] + patch_delta(norm([x, r]))          # DELTAREG=1
@@ -140,6 +142,7 @@ if RESUME:
         "DELTA_BACKEND": "delta_backend",
         "DELTA_CHUNK_SIZE": "delta_chunk_size",
         "DELTAREG": "deltareg",
+        "SKIPATTN": "skipattn",
         "READOUT": "readout",
         "MIDOUT": "midout",
         "RMSNORM": "rmsnorm",
@@ -193,6 +196,12 @@ D = int(os.environ.get("D", 384))
 T = int(os.environ.get("T", 4))
 if T < 1:
     raise ValueError(f"T={T} must be positive")
+try:
+    SKIPATTN = int(os.environ.get("SKIPATTN", 1))
+except ValueError as exc:
+    raise ValueError("SKIPATTN must be a positive integer") from exc
+if SKIPATTN < 1:
+    raise ValueError(f"SKIPATTN={SKIPATTN} must be a positive integer")
 N_REG_RAW = os.environ.get("N_REG", "8").strip()
 if N_REG_RAW.startswith("[") and N_REG_RAW.endswith("]"):
     N_REG_RAW = N_REG_RAW[1:-1]
@@ -305,9 +314,10 @@ SEEDS = [int(s) for s in os.environ.get("SEEDS", "0,1,2").split(",")]
 LIMIT_TRAIN = int(os.environ.get("LIMIT_TRAIN", 0))
 LIMIT_VAL = int(os.environ.get("LIMIT_VAL", 0))
 DELTAREG_OUTPUT_SUFFIX = "_dreg1" if DELTAREG else ""
+SKIPATTN_OUTPUT_SUFFIX = f"_skipattn{SKIPATTN}" if SKIPATTN != 1 else ""
 OUTPUT_DIR = os.environ.get(
     "OUTPUT_DIR",
-    f"outputs/imagenet_delta_peq_patchdelta{DELTAREG_OUTPUT_SUFFIX}_{STAGE_LAYOUT}_refine{REFINE_ATTN}_{DELTA_BACKEND_LABEL}_sdpa{SDPA_BACKEND_LABEL}_c{DELTA_CHUNK_SIZE}_D{D}_NREG{N_REG_LABEL}_T{T}_img{IMG}_readout{READOUT}_midout{MIDOUT}",
+    f"outputs/imagenet_delta_peq_patchdelta{DELTAREG_OUTPUT_SUFFIX}{SKIPATTN_OUTPUT_SUFFIX}_{STAGE_LAYOUT}_refine{REFINE_ATTN}_{DELTA_BACKEND_LABEL}_sdpa{SDPA_BACKEND_LABEL}_c{DELTA_CHUNK_SIZE}_D{D}_NREG{N_REG_LABEL}_T{T}_img{IMG}_readout{READOUT}_midout{MIDOUT}",
 )
 if resume_checkpoint is not None:
     saved_mode = resume_checkpoint.get("mode", resume_config.get("mode"))
@@ -420,6 +430,7 @@ def run_config(mode, seed, nparam):
         "delta_backend": DELTA_BACKEND,
         "delta_chunk_size": DELTA_CHUNK_SIZE,
         "deltareg": DELTAREG,
+        "skipattn": SKIPATTN,
         "delta_conv_size": DELTA_CONV_SIZE,
         "delta_norm_eps": DELTA_NORM_EPS,
         "readout": READOUT,
@@ -617,7 +628,7 @@ def validate_resume_checkpoint(checkpoint, mode, seed, nparam, expanded_layersca
         "model_family", "model_arch", "img", "resize", "patch", "dim", "n_reg",
         "n_reg_schedule", "max_n_reg", "heads",
         "attn", "stage_layout", "sdpa_backend", "patch_attention", "compress_attention", "refine_attention",
-        "broadcast_attention", "delta_backend", "delta_chunk_size", "deltareg", "delta_conv_size",
+        "broadcast_attention", "delta_backend", "delta_chunk_size", "deltareg", "skipattn", "delta_conv_size",
         "delta_norm_eps", "readout", "midout", "midout_weight", "midout_iteration",
         "rmsnorm", "layerscale", "layerscale_layout",
         "ls_init", "T", "epochs",
@@ -625,6 +636,10 @@ def validate_resume_checkpoint(checkpoint, mode, seed, nparam, expanded_layersca
         "max_lr", "min_lr", "warmup_epochs", "grad_accum_steps", "optimizer", "weight_decay",
         "label_smoothing", "amp", "amp_dtype", "num_classes",
     )
+    # Checkpoints written before SKIPATTN existed used attention on every
+    # iteration, which is exactly SKIPATTN=1.
+    if saved_config and "skipattn" not in saved_config:
+        saved_config = {**saved_config, "skipattn": 1}
     mismatches = [
         f"{key}: checkpoint={saved_config[key]!r}, current={current_config[key]!r}"
         for key in critical_keys
@@ -806,7 +821,16 @@ class Block(nn.Module):
             scale = scale[t]
         return scale * value
 
-    def forward(self, x, r, data, n_reg, t=0, return_broadcast_weights=False):
+    def forward(
+        self,
+        x,
+        r,
+        data,
+        n_reg,
+        t=0,
+        return_broadcast_weights=False,
+        use_attention=True,
+    ):
         if not 1 <= n_reg <= r.size(1):
             raise ValueError(
                 f"Active register count must be in [1, {r.size(1)}], got {n_reg}"
@@ -834,6 +858,12 @@ class Block(nn.Module):
             nx = self.lnp(x)
             patch_output = self.patch_delta(nx)
             x = x + self._scale("ls_p", patch_output, t)
+        if not use_attention:
+            if inactive_r.size(1):
+                r = torch.cat((r, inactive_r), dim=1)
+            # Preserve the per-iteration diagnostics interface without running
+            # any register attention solely to compute a reconstruction error.
+            return x, r, x.new_zeros(()), None
         lx = self.lnc(x)
         compress_output = (
             self.rats_attention("compress", self.lnr(r), lx, lx)
@@ -958,6 +988,8 @@ class Net(nn.Module):
         for t in range(self.T):
             blk = self.blocks[t] if self.mode == "untied" else self.block
             n_reg = self.n_reg_schedule[t]
+            iteration = t + 1
+            use_attention = iteration % SKIPATTN == 0
             r_prev = r[:, :n_reg]
             is_midout_iteration = (
                 return_midout
@@ -970,8 +1002,10 @@ class Net(nn.Module):
                 self.data,
                 n_reg,
                 t,
+                use_attention=use_attention,
                 return_broadcast_weights=(
-                    READOUT == "weighted"
+                    use_attention
+                    and READOUT == "weighted"
                     and (t == self.T - 1 or is_midout_iteration)
                 ),
             )
@@ -1242,7 +1276,7 @@ log(f"device={dev}  distributed={distributed}  world_size={world_size}  amp={use
 log(
     f"img={IMG}  L={L} tok  N_schedule={N_REG_SCHEDULE} reg  "
     f"max_N={MAX_N_REG}  D={D}  heads={HEADS}  T={T}  "
-    f"epochs={EPOCHS}  seeds={SEEDS}"
+    f"skipattn={SKIPATTN}  epochs={EPOCHS}  seeds={SEEDS}"
 )
 log(
     f"lr={MAX_LR:g}->{MIN_LR:g}  warmup_epochs={WARMUP_EPOCHS}  "

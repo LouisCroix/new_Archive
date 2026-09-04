@@ -67,6 +67,7 @@ echo "model and training config will be restored from checkpoint"
 if [[ "${GPUS_PER_NODE}" -gt 1 ]]; then
     "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \
+        --local_addr=127.0.0.1 \
         --nnodes=1 \
         --nproc_per_node="${GPUS_PER_NODE}" \
         delta_peq.py

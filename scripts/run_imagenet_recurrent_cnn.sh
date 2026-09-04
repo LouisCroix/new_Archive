@@ -17,42 +17,57 @@ DEFAULT_PROJECT_ROOT="$(dirname -- "${SCRIPT_DIR}")"
 export PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-${DEFAULT_PROJECT_ROOT}}}"
 cd "${PROJECT_ROOT}"
 
-# Architecture selection only. Naive uses native first-stage blocks; pro uses
-# native early stages and recurrent third-stage blocks. Widths, kernels, norms,
-# expansion ratios, LayerScale, and initialization remain native.
-export BLOCK_TYPE="${BLOCK_TYPE:-convnext}"  # resnet or convnext
-if [[ "${BLOCK_TYPE}" != "resnet" && "${BLOCK_TYPE}" != "convnext" ]]; then
-    echo "Unsupported BLOCK_TYPE=${BLOCK_TYPE}; use resnet or convnext" >&2
+# ARR1 is the number of unique blocks in each native ConvNeXt stage. ARR2 is
+# the number of times the complete stage is repeated with shared parameters.
+# V=1 uses the current ConvNeXt block; V=2 uses ConvNeXt V2 with GRN.
+export ARR1="${ARR1:-1,1,1,0}"
+export ARR2="${ARR2:-3,3,6,0}"
+export REG_MODE="${REG_MODE:-0,0,1,0}"
+export N_REG="${N_REG:-8,8,64,8}"
+export DELTA_MODE="${DELTA_MODE:-0}"
+export REG_HEAD="${REG_HEAD:-0}"
+export V="${V:-2}"
+if [[ "${V}" != "1" && "${V}" != "2" ]]; then
+    echo "V must be 1 or 2, got ${V}" >&2
     exit 1
 fi
-export MODE="${MODE:-pro}"  # naive or pro
-if [[ "${MODE}" != "naive" && "${MODE}" != "pro" ]]; then
-    echo "Unsupported MODE=${MODE}; use naive or pro" >&2
+if [[ ! "${ARR1}" =~ ^[0-9]+(,[0-9]+){3}$ ]]; then
+    echo "ARR1 must contain exactly four comma-separated non-negative integers" >&2
     exit 1
 fi
-export BLOCK_DEPTH="${BLOCK_DEPTH:-1}"
-if [[ ! "${BLOCK_DEPTH}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "BLOCK_DEPTH must be a positive integer, got ${BLOCK_DEPTH}" >&2
+if [[ ! "${ARR2}" =~ ^[0-9]+(,[0-9]+){3}$ ]]; then
+    echo "ARR2 must contain exactly four comma-separated non-negative integers" >&2
     exit 1
 fi
-export T="${T:-12}"
+if [[ ! "${REG_MODE}" =~ ^[01](,[01]){3}$ ]]; then
+    echo "REG_MODE must contain exactly four comma-separated 0/1 values" >&2
+    exit 1
+fi
+if [[ ! "${N_REG}" =~ ^[1-9][0-9]*(,[1-9][0-9]*){3}$ ]]; then
+    echo "N_REG must contain exactly four comma-separated positive integers" >&2
+    exit 1
+fi
+if [[ ! "${DELTA_MODE}" =~ ^[01]$ || ! "${REG_HEAD}" =~ ^[01]$ ]]; then
+    echo "DELTA_MODE and REG_HEAD must each be 0 or 1" >&2
+    exit 1
+fi
 
 export DATA_ROOT="${DATA_ROOT:-/cis/project/peq_project/imagenet-1k}"
 export IMG="${IMG:-224}"
 export RESIZE="${RESIZE:-256}"
-export EPOCHS="${EPOCHS:-22}"
 export BS="${BS:-512}"
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 export WORKERS="${WORKERS:-4}"
 export MAX_LR="${MAX_LR:-5e-4}"
 export MIN_LR="${MIN_LR:-1e-6}"
-export WARMUP_EPOCHS="${WARMUP_EPOCHS:-2}"
+export EPOCHS="${EPOCHS:-100}"
+export WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
 export SEEDS="${SEEDS:-0}"
 export AMP="${AMP:-1}"
 export AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 export PROGRESS="${PROGRESS:-0}"
 export MEMORY_PROBE="${MEMORY_PROBE:-0}"
-export DATALOADER_TIMEOUT="${DATALOADER_TIMEOUT:-120}"
+export DATALOADER_TIMEOUT="${DATALOADER_TIMEOUT:-600}"
 export REQUIRE_CUDA="${REQUIRE_CUDA:-1}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -60,7 +75,26 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
 export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
-export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_recurrent_v3_${MODE}_${BLOCK_TYPE}_depth${BLOCK_DEPTH}_T${T}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_lr${MAX_LR}_minlr${MIN_LR}}"
+ARR1_SLUG="${ARR1//,/-}"
+ARR2_SLUG="${ARR2//,/-}"
+REG_MODE_SLUG="${REG_MODE//,/-}"
+N_REG_SLUG="${N_REG//,/-}"
+if [[ "${REG_MODE}" == "0,0,0,0" ]]; then
+    REG_SUFFIX=""
+    EXPERIMENT_VERSION=6
+else
+    REG_SUFFIX="_REG-${REG_MODE_SLUG}_NREG-${N_REG_SLUG}"
+    EXPERIMENT_VERSION=7
+fi
+if [[ "${DELTA_MODE}" == "1" ]]; then
+    REG_SUFFIX+="_DELTA1"
+    EXPERIMENT_VERSION=8
+fi
+if [[ "${REG_HEAD}" == "1" ]]; then
+    REG_SUFFIX+="_REGHEAD1"
+    EXPERIMENT_VERSION=8
+fi
+export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_recurrent_v${EXPERIMENT_VERSION}_convnextV${V}_ARR1-${ARR1_SLUG}_ARR2-${ARR2_SLUG}${REG_SUFFIX}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_lr${MAX_LR}_minlr${MIN_LR}}"
 export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -75,7 +109,7 @@ fi
 
 echo "node=${SLURMD_NODENAME:-none} job_id=${SLURM_JOB_ID:-none}"
 echo "python_bin=${PYTHON_BIN} cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-none} gpus=${GPUS_PER_NODE}"
-echo "block_type=${BLOCK_TYPE} mode=${MODE} block_depth=${BLOCK_DEPTH} T=${T} architecture=native recurrent_norm=v2 tied_cell=1 activation_checkpointing=0"
+echo "model=convnext V=${V} ARR1=${ARR1} ARR2=${ARR2} REG_MODE=${REG_MODE} N_REG=${N_REG} DELTA_MODE=${DELTA_MODE} REG_HEAD=${REG_HEAD} architecture=four_stage_array_tied activation_checkpointing=0"
 echo "epochs=${EPOCHS} BS_per_gpu=${BS} accum=${GRAD_ACCUM_STEPS} workers_per_rank=${WORKERS} OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 echo "progress=${PROGRESS} dataloader_timeout=${DATALOADER_TIMEOUT}s nccl_trace_buffer=${TORCH_NCCL_TRACE_BUFFER_SIZE}"
 echo "max_lr=${MAX_LR} min_lr=${MIN_LR} warmup_epochs=${WARMUP_EPOCHS}"
