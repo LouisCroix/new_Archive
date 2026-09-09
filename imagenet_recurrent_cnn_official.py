@@ -43,6 +43,7 @@ from timm.utils import (
     setup_default_logging,
 )
 
+from deltanet import require_fla
 from imagenet_data import NumericImageFolder
 from recurrent_cnn import (
     DELTA_BACKEND,
@@ -55,6 +56,7 @@ from recurrent_cnn import (
     REG_SDPA_BACKEND,
     RecurrentCNN,
     model_arch_name,
+    validate_convnext_version,
     validate_register_arrays,
     validate_stage_arrays,
 )
@@ -706,6 +708,21 @@ def prepare_metrics_file(path: Path, start_epoch: int, resume: bool) -> None:
     os.replace(temporary, path)
 
 
+def best_raw_acc1_from_metrics(path: Path, before_epoch: Optional[int] = None) -> float:
+    best_raw_acc1 = -1.0
+    if not path.exists():
+        return best_raw_acc1
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if before_epoch is not None and int(record["epoch"]) >= before_epoch:
+                continue
+            best_raw_acc1 = max(best_raw_acc1, float(record["raw"]["acc1"]))
+    return best_raw_acc1
+
+
 def init_wandb(args, config: dict[str, Any], checkpoint: Optional[dict[str, Any]]):
     if not is_primary(args) or args.wandb_mode == "disabled":
         return None
@@ -791,6 +808,12 @@ def build_config(
             "register_data_term": False,
             "register_reconstruction": False,
             "register_layerscale": False,
+            "register_attention_drop_path": bool(model.register_stage_count),
+            "register_mlp_drop_path": bool(model.register_stage_count),
+            "register_attention_drop_path_schedule": model.register_drop_path_schedule,
+            "register_attention_drop_path_rates": list(model.register_drop_path_rates),
+            "register_mlp_drop_path_schedule": model.register_drop_path_schedule,
+            "register_mlp_drop_path_rates": list(model.register_drop_path_rates),
             "parameters": sum(parameter.numel() for parameter in model.parameters()),
             "drop_path_rate": model.drop_path_rate,
             "drop_path_schedule": model.drop_path_schedule,
@@ -834,6 +857,7 @@ def checkpoint_state(
     epoch: int,
     num_updates: int,
     best_ema_acc1: float,
+    best_raw_acc1: float,
     rng_by_rank,
     run,
 ) -> dict[str, Any]:
@@ -843,6 +867,7 @@ def checkpoint_state(
         "epoch": epoch,
         "num_updates": num_updates,
         "best_ema_acc1": best_ema_acc1,
+        "best_raw_acc1": best_raw_acc1,
         "world_size": args.world_size,
         "arguments": _plain_args(args),
         "config": config,
@@ -866,7 +891,12 @@ def restore_training_state(checkpoint, model, model_ema, optimizer, scheduler, l
     start_epoch = int(checkpoint["epoch"]) + 1
     num_updates = int(checkpoint["num_updates"])
     scheduler.step_update(num_updates)
-    return start_epoch, num_updates, float(checkpoint.get("best_ema_acc1", -1.0))
+    return (
+        start_epoch,
+        num_updates,
+        float(checkpoint.get("best_ema_acc1", -1.0)),
+        float(checkpoint.get("best_raw_acc1", -1.0)),
+    )
 
 
 def synchronized_stop_requested(args) -> bool:
@@ -887,17 +917,21 @@ def architecture_suffix(
     repeats,
     reg_mode=DEFAULT_REG_MODE,
     n_reg=DEFAULT_N_REG,
+    *,
+    convnext_version,
     delta_mode=False,
     reg_head=False,
 ) -> str:
+    version = validate_convnext_version(convnext_version)
     arr1 = "-".join(map(str, depths))
     arr2 = "-".join(map(str, repeats))
     modes, counts = validate_register_arrays(reg_mode, n_reg, depths)
-    suffix = f"ARR1-{arr1}_ARR2-{arr2}"
+    suffix = f"convnextV{version}_ARR1-{arr1}_ARR2-{arr2}"
+    reg = "-".join(map(str, modes))
+    suffix += f"_REG-{reg}"
     if any(modes):
-        reg = "-".join(map(str, modes))
         nreg = "-".join(map(str, counts))
-        suffix += f"_REG-{reg}_NREG-{nreg}"
+        suffix += f"_NREG-{nreg}"
     if delta_mode:
         suffix += "_DELTA1"
     if reg_head:
@@ -911,6 +945,8 @@ def append_architecture_suffix(
     repeats,
     reg_mode=DEFAULT_REG_MODE,
     n_reg=DEFAULT_N_REG,
+    *,
+    convnext_version,
     delta_mode=False,
     reg_head=False,
 ) -> str:
@@ -920,6 +956,7 @@ def append_architecture_suffix(
         repeats,
         reg_mode,
         n_reg,
+        convnext_version=convnext_version,
         delta_mode=delta_mode,
         reg_head=reg_head,
     )
@@ -927,9 +964,17 @@ def append_architecture_suffix(
 
 
 def default_output_dir(args, depths, repeats) -> str:
+    suffix = architecture_suffix(
+        depths,
+        repeats,
+        args.reg_mode,
+        args.n_reg,
+        convnext_version=args.convnext_version,
+        delta_mode=args.delta_mode,
+        reg_head=args.reg_head,
+    )
     return (
-        f"outputs/imagenet_recurrent_official_convnextV{args.convnext_version}_"
-        f"{architecture_suffix(depths, repeats, args.reg_mode, args.n_reg, args.delta_mode, args.reg_head)}_"
+        f"outputs/imagenet_recurrent_official_{suffix}_"
         f"ep{args.epochs}_warmup{args.warmup_epochs}_"
         f"gbs{effective_batch_size(args)}_seed{args.seed}"
     )
@@ -958,6 +1003,14 @@ def run(args) -> None:
     if args.device.type != "cuda" and args.amp:
         LOG.warning("Disabling AMP on non-CUDA device %s", args.device)
         args.amp = False
+    if args.delta_mode and DELTA_BACKEND != "naive":
+        if args.device.type != "cuda":
+            raise RuntimeError(
+                f"DELTA_BACKEND={DELTA_BACKEND} requires CUDA when --delta-mode is enabled"
+            )
+        if DELTA_BACKEND in {"auto", "fla", "chunk"} and not args.amp:
+            raise ValueError(f"DELTA_BACKEND={DELTA_BACKEND} requires --amp")
+        require_fla()
     if resume_checkpoint is not None:
         saved_amp = bool(resume_checkpoint["arguments"]["amp"])
         if args.amp != saved_amp:
@@ -982,6 +1035,7 @@ def run(args) -> None:
             repeats,
             reg_mode,
             n_reg,
+            convnext_version=args.convnext_version,
             delta_mode=args.delta_mode,
             reg_head=args.reg_head,
         )
@@ -991,6 +1045,7 @@ def run(args) -> None:
             repeats,
             reg_mode,
             n_reg,
+            convnext_version=args.convnext_version,
             delta_mode=args.delta_mode,
             reg_head=args.reg_head,
         )
@@ -1069,6 +1124,15 @@ def run(args) -> None:
         saved_architecture.setdefault("register_data_term", False)
         saved_architecture.setdefault("register_reconstruction", False)
         saved_architecture.setdefault("register_layerscale", False)
+        for key in (
+            "register_attention_drop_path",
+            "register_mlp_drop_path",
+            "register_attention_drop_path_schedule",
+            "register_attention_drop_path_rates",
+            "register_mlp_drop_path_schedule",
+            "register_mlp_drop_path_rates",
+        ):
+            saved_architecture.setdefault(key, config["architecture"][key])
         saved_config["architecture"] = saved_architecture
         for key in ("model_arch", "recipe", "architecture", "dataset"):
             if saved_config.get(key) != config.get(key):
@@ -1103,9 +1167,9 @@ def run(args) -> None:
         if args.amp and args.amp_dtype == "float16" and args.device.type == "cuda"
         else None
     )
-    start_epoch, num_updates, best_ema_acc1 = 0, 0, -1.0
+    start_epoch, num_updates, best_ema_acc1, best_raw_acc1 = 0, 0, -1.0, -1.0
     if resume_checkpoint is not None:
-        start_epoch, num_updates, best_ema_acc1 = restore_training_state(
+        start_epoch, num_updates, best_ema_acc1, best_raw_acc1 = restore_training_state(
             resume_checkpoint,
             model,
             model_ema,
@@ -1126,6 +1190,10 @@ def run(args) -> None:
     metrics_path = output_dir / "metrics.jsonl"
     if is_primary(args):
         prepare_metrics_file(metrics_path, start_epoch, bool(args.resume))
+        best_raw_acc1 = max(
+            best_raw_acc1,
+            best_raw_acc1_from_metrics(metrics_path, before_epoch=start_epoch),
+        )
 
     if is_primary(args):
         LOG.info(
@@ -1175,8 +1243,10 @@ def run(args) -> None:
         )
         raw_metrics = evaluate(args, model, val_loader)
         ema_metrics = evaluate(args, model_ema.module, val_loader)
-        improved = ema_metrics["acc1"] > best_ema_acc1
+        improved_ema = ema_metrics["acc1"] > best_ema_acc1
+        improved_raw = raw_metrics["acc1"] > best_raw_acc1
         best_ema_acc1 = max(best_ema_acc1, ema_metrics["acc1"])
+        best_raw_acc1 = max(best_raw_acc1, raw_metrics["acc1"])
         elapsed = time.time() - epoch_started
         record = {
             "epoch": epoch,
@@ -1186,6 +1256,7 @@ def run(args) -> None:
             "raw": raw_metrics,
             "ema": ema_metrics,
             "best_ema_acc1": best_ema_acc1,
+            "best_raw_acc1": best_raw_acc1,
             "epoch_sec": elapsed,
         }
         if is_primary(args):
@@ -1205,12 +1276,15 @@ def run(args) -> None:
                 epoch,
                 num_updates,
                 best_ema_acc1,
+                best_raw_acc1,
                 rng_by_rank,
                 run_handle,
             )
             atomic_torch_save(state, latest_path)
-            if improved:
+            if improved_ema:
                 duplicate_checkpoint(latest_path, output_dir / "checkpoint_best.pt")
+            if improved_raw:
+                duplicate_checkpoint(latest_path, output_dir / "checkpoint_best_raw.pt")
             if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
                 duplicate_checkpoint(
                     latest_path,
@@ -1219,12 +1293,13 @@ def run(args) -> None:
             if epoch + 1 == args.epochs:
                 duplicate_checkpoint(latest_path, output_dir / "checkpoint_final.pt")
             LOG.info(
-                "epoch=%d/%d train_loss=%.4f raw_acc1=%.3f ema_acc1=%.3f "
-                "best_ema=%.3f lr=%.3e sec=%.1f",
+                "epoch=%d/%d train_loss=%.4f raw_acc1=%.3f best_raw=%.3f "
+                "ema_acc1=%.3f best_ema=%.3f lr=%.3e sec=%.1f",
                 epoch + 1,
                 args.epochs,
                 train_metrics["loss"],
                 raw_metrics["acc1"],
+                best_raw_acc1,
                 ema_metrics["acc1"],
                 best_ema_acc1,
                 epoch_lr,

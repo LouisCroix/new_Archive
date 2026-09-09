@@ -24,7 +24,7 @@ from torchvision.models.convnext import CNBlock, LayerNorm2d
 from torchvision.ops import stochastic_depth
 
 from imagenet_data import make_imagenet_loaders
-from deltanet import DeltaNet
+from deltanet import DELTA_BACKENDS, DeltaNet, require_fla
 from rats_attention import RATSAttention
 
 try:
@@ -41,11 +41,19 @@ DEFAULT_REG_MODE = (0, 0, 0, 0)
 DEFAULT_N_REG = (8, 8, 8, 8)
 REG_HEADS = 6
 REG_SDPA_BACKEND = "flash"
-DELTA_BACKEND = "auto"
-DELTA_CHUNK_SIZE = 64
+DELTA_BACKEND = os.environ.get("DELTA_BACKEND", "auto").lower()
+DELTA_CHUNK_SIZE = int(os.environ.get("DELTA_CHUNK_SIZE", 64))
 DELTA_CONV_SIZE = 4
 DELTA_NORM_EPS = 1e-5
 SUPPORTED_CONVNEXT_VERSIONS = (1, 2)
+
+if DELTA_BACKEND not in DELTA_BACKENDS:
+    raise ValueError(
+        f"Unsupported DELTA_BACKEND={DELTA_BACKEND}; "
+        f"use {', '.join(sorted(DELTA_BACKENDS))}"
+    )
+if DELTA_CHUNK_SIZE not in {16, 32, 64}:
+    raise ValueError("DELTA_CHUNK_SIZE must be 16, 32, or 64")
 
 
 def env_flag(name, default=0):
@@ -244,7 +252,7 @@ class RATSRegisterBlock(nn.Module):
     def initial_registers(self, batch_size):
         return self.r0.expand(batch_size, -1, -1).contiguous()
 
-    def forward(self, inputs, registers):
+    def forward(self, inputs, registers, stochastic_depth_prob=0.0):
         if inputs.ndim != 4 or inputs.size(1) != self.width:
             raise ValueError(
                 f"Expected NCHW features with C={self.width}, got {tuple(inputs.shape)}"
@@ -256,28 +264,52 @@ class RATSRegisterBlock(nn.Module):
             )
         batch, channels, height, width = inputs.shape
         tokens = inputs.flatten(2).transpose(1, 2)
+        drop_path_prob = float(stochastic_depth_prob)
         if self.delta_mode:
-            tokens = tokens + self.patch_delta(self.lnp(tokens))
+            tokens = tokens + stochastic_depth(
+                self.patch_delta(self.lnp(tokens)),
+                drop_path_prob,
+                "row",
+                self.training,
+            )
 
         features = self.lnc(tokens)
-        registers = registers + self.attention(
-            "compress", self.lnr(registers), features, features
+        registers = registers + stochastic_depth(
+            self.attention("compress", self.lnr(registers), features, features),
+            drop_path_prob,
+            "row",
+            self.training,
         )
         normalized_registers = self.lnr(registers)
-        registers = registers + self.attention(
-            "refine",
-            normalized_registers,
-            normalized_registers,
-            normalized_registers,
+        registers = registers + stochastic_depth(
+            self.attention(
+                "refine",
+                normalized_registers,
+                normalized_registers,
+                normalized_registers,
+            ),
+            drop_path_prob,
+            "row",
+            self.training,
         )
         normalized_registers = self.lnr(registers)
-        tokens = tokens + self.attention(
-            "broadcast",
-            self.lnb(tokens),
-            normalized_registers,
-            normalized_registers,
+        tokens = tokens + stochastic_depth(
+            self.attention(
+                "broadcast",
+                self.lnb(tokens),
+                normalized_registers,
+                normalized_registers,
+            ),
+            drop_path_prob,
+            "row",
+            self.training,
         )
-        tokens = tokens + self.w2(self.act(self.w1(self.lnm(tokens))))
+        tokens = tokens + stochastic_depth(
+            self.w2(self.act(self.w1(self.lnm(tokens)))),
+            drop_path_prob,
+            "row",
+            self.training,
+        )
         outputs = tokens.transpose(1, 2).contiguous().reshape(
             batch, channels, height, width
         )
@@ -303,6 +335,11 @@ class RepeatedStage(nn.Module):
                 "drop_path_probs must contain one value per block application; "
                 f"expected {applications}, got {len(self.drop_path_probs)}"
             )
+        stage_depth = len(stage)
+        self.register_drop_path_probs = tuple(
+            self.drop_path_probs[(repeat_index + 1) * stage_depth - 1]
+            for repeat_index in range(repeats)
+        )
 
     def forward(self, inputs, log_residuals=False):
         outputs = inputs
@@ -313,14 +350,18 @@ class RepeatedStage(nn.Module):
         )
         residuals = []
         application_index = 0
-        for _ in range(self.repeats):
+        for repeat_index in range(self.repeats):
             previous = outputs
             for block in self.stage:
                 block._drop_path_prob = self.drop_path_probs[application_index]
                 application_index += 1
             outputs = self.stage(outputs)
             if self.register_block is not None:
-                outputs, registers = self.register_block(outputs, registers)
+                outputs, registers = self.register_block(
+                    outputs,
+                    registers,
+                    stochastic_depth_prob=self.register_drop_path_probs[repeat_index],
+                )
             if log_residuals:
                 numerator = (outputs - previous).float().flatten(1).norm(dim=1).mean()
                 denominator = outputs.float().flatten(1).norm(dim=1).mean().clamp_min(1e-8)
@@ -446,6 +487,7 @@ class RecurrentCNN(nn.Module):
                 for index in range(self.block_applications)
             )
         self.drop_path_schedule = "unrolled_linear"
+        self.register_drop_path_schedule = "stage_terminal_unrolled_linear"
 
         stem_width = 96
         stem_norm = partial(LayerNorm2d, eps=1e-6)
@@ -458,6 +500,7 @@ class RecurrentCNN(nn.Module):
         # optimizer parameter order after deterministic state_dict key migration.
         features = []
         self.stage_feature_indices = []
+        register_drop_path_rates = []
         drop_path_offset = 0
         for stage_index in range(self.active_stages):
             width = STAGE_WIDTHS[stage_index]
@@ -482,6 +525,12 @@ class RecurrentCNN(nn.Module):
                 if reg_mode[stage_index]
                 else None
             )
+            if register_block is not None:
+                register_drop_path_rates.extend(
+                    stage_drop_path_probs[
+                        depths[stage_index] - 1::depths[stage_index]
+                    ]
+                )
             features.append(
                 RepeatedStage(
                     stage,
@@ -493,6 +542,7 @@ class RecurrentCNN(nn.Module):
             if stage_index + 1 < self.active_stages:
                 features.append(self._make_downsample(width, STAGE_WIDTHS[stage_index + 1]))
         self.features = nn.ModuleList(features)
+        self.register_drop_path_rates = tuple(register_drop_path_rates)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.readout_width = self.last_width * (2 if self.reg_head else 1)
         self.head_norm = nn.LayerNorm(self.readout_width, eps=1e-6)
@@ -700,6 +750,11 @@ def main():
     )
     delta_mode = env_flag("DELTA_MODE", 0)
     reg_head = env_flag("REG_HEAD", 0)
+    delta_require_fla = env_flag("DELTA_REQUIRE_FLA", 0)
+    if delta_mode and delta_require_fla:
+        # Populate the cached FLA operators before model construction. Once this
+        # succeeds, DELTA_BACKEND=auto cannot silently select the naive path.
+        require_fla()
     convnext_version = validate_convnext_version(os.environ.get("V", 1))
     model_arch = model_arch_name(
         convnext_version,
@@ -742,6 +797,7 @@ def main():
             "delta_mode": delta_mode,
             "reg_head": reg_head,
             "delta_backend": DELTA_BACKEND if delta_mode else None,
+            "delta_require_fla": delta_require_fla if delta_mode else None,
             "delta_chunk_size": DELTA_CHUNK_SIZE if delta_mode else None,
             "delta_conv_size": DELTA_CONV_SIZE if delta_mode else None,
             "delta_norm_eps": DELTA_NORM_EPS if delta_mode else None,
@@ -758,6 +814,12 @@ def main():
             "register_heads": REG_HEADS,
             "register_sdpa_backend": REG_SDPA_BACKEND,
             "register_mlp_ratio": 4,
+            "register_attention_drop_path": bool(register_stage_count),
+            "register_mlp_drop_path": bool(register_stage_count),
+            "register_attention_drop_path_schedule": model.register_drop_path_schedule,
+            "register_attention_drop_path_rates": list(model.register_drop_path_rates),
+            "register_mlp_drop_path_schedule": model.register_drop_path_schedule,
+            "register_mlp_drop_path_rates": list(model.register_drop_path_rates),
             "parameters": total,
             "trainable_parameters": trainable,
             "stochastic_depth_prob": 0.0,
@@ -783,6 +845,13 @@ def main():
     amp_dtype = amp_dtypes.get(amp_dtype_name)
     if amp_enabled and amp_dtype is None:
         raise ValueError(f"Unsupported AMP_DTYPE={amp_dtype_name}; use bfloat16 or float16")
+    if delta_mode and DELTA_BACKEND == "auto" and device_type == "cuda":
+        if not amp_enabled:
+            raise ValueError(
+                "DELTA_BACKEND=auto on CUDA requires AMP=1; set "
+                "DELTA_BACKEND=naive explicitly for the readable recurrence"
+            )
+        require_fla()
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=amp_enabled and amp_dtype == torch.float16 and device_type == "cuda",
@@ -887,6 +956,7 @@ def main():
             "delta_mode": delta_mode,
             "reg_head": reg_head,
             "delta_backend": DELTA_BACKEND if delta_mode else None,
+            "delta_require_fla": delta_require_fla if delta_mode else None,
             "delta_chunk_size": DELTA_CHUNK_SIZE if delta_mode else None,
             "delta_conv_size": DELTA_CONV_SIZE if delta_mode else None,
             "delta_norm_eps": DELTA_NORM_EPS if delta_mode else None,
@@ -906,6 +976,12 @@ def main():
             "register_data_term": False,
             "register_reconstruction": False,
             "register_layerscale": False,
+            "register_attention_drop_path": bool(register_stage_count),
+            "register_mlp_drop_path": bool(register_stage_count),
+            "register_attention_drop_path_schedule": "stage_terminal_unrolled_linear",
+            "register_attention_drop_path_rates": [0.0] * register_applications,
+            "register_mlp_drop_path_schedule": "stage_terminal_unrolled_linear",
+            "register_mlp_drop_path_rates": [0.0] * register_applications,
             "stem": "convnext_tiny_conv4_s4_layernorm2d",
             "normalization_state": "stateless_layernorm_per_call",
             "weight_tying": "each_stage_sequence_shared_across_its_repeats",
@@ -1340,6 +1416,8 @@ def main():
         f"model=convnext V={convnext_version} ARR1={arr1_slug} ARR2={arr2_slug} "
         f"REG_MODE={reg_mode_slug} N_REG={n_reg_slug} "
         f"DELTA_MODE={int(delta_mode)} REG_HEAD={int(reg_head)} "
+        f"DELTA_BACKEND={DELTA_BACKEND if delta_mode else 'disabled'} "
+        f"DELTA_REQUIRE_FLA={int(delta_require_fla)} "
         f"active_stages={active_stages} last_width={last_width} "
         f"unique_blocks={unique_blocks} block_applications={block_applications} "
         f"register_stages={register_stage_count} register_applications={register_applications} "

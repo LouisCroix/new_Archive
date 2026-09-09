@@ -14,6 +14,7 @@ from imagenet_recurrent_cnn_official import (
     DistributedEvalSampler,
     append_architecture_suffix,
     architecture_suffix,
+    best_raw_acc1_from_metrics,
     build_config,
     create_optimizer,
     create_train_criterion,
@@ -30,6 +31,23 @@ from recurrent_cnn import RecurrentCNN
 
 
 class RecurrentCNNOfficialTest(unittest.TestCase):
+    def test_best_raw_acc1_from_metrics_respects_resume_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / "metrics.jsonl"
+            records = [
+                {"epoch": 0, "raw": {"acc1": 60.0}},
+                {"epoch": 1, "raw": {"acc1": 72.5}},
+                {"epoch": 2, "raw": {"acc1": 70.0}},
+            ]
+            metrics_path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
+            self.assertEqual(best_raw_acc1_from_metrics(metrics_path), 72.5)
+            self.assertEqual(
+                best_raw_acc1_from_metrics(metrics_path, before_epoch=1),
+                60.0,
+            )
+
     def test_default_arguments_match_official_recipe(self):
         with patch.dict(os.environ, {"EPOCHS": "300", "WARMUP_EPOCHS": "20"}):
             args = parse_args([])
@@ -51,15 +69,37 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         self.assertEqual(model.stage_depths, (2, 3, 0, 0))
         self.assertEqual(model.stage_repeats, (4, 5, 0, 0))
 
-        suffix = architecture_suffix(model.stage_depths, model.stage_repeats)
-        self.assertEqual(suffix, "ARR1-2-3-0-0_ARR2-4-5-0-0")
+        suffix = architecture_suffix(
+            model.stage_depths, model.stage_repeats, convnext_version=2
+        )
         self.assertEqual(
-            append_architecture_suffix("outputs/custom", model.stage_depths, model.stage_repeats),
+            suffix,
+            "convnextV2_ARR1-2-3-0-0_ARR2-4-5-0-0_REG-0-0-0-0",
+        )
+        self.assertEqual(
+            append_architecture_suffix(
+                "outputs/custom",
+                model.stage_depths,
+                model.stage_repeats,
+                convnext_version=2,
+            ),
             f"outputs/custom_{suffix}",
         )
         self.assertEqual(
-            append_architecture_suffix("my-wandb-project", model.stage_depths, model.stage_repeats),
+            append_architecture_suffix(
+                "my-wandb-project",
+                model.stage_depths,
+                model.stage_repeats,
+                convnext_version=2,
+            ),
             f"my-wandb-project_{suffix}",
+        )
+        self.assertTrue(
+            architecture_suffix(
+                model.stage_depths,
+                model.stage_repeats,
+                convnext_version=1,
+            ).startswith("convnextV1_")
         )
 
         reg_suffix = architecture_suffix(
@@ -67,10 +107,11 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
             model.stage_repeats,
             (1, 0, 0, 0),
             (2, 3, 4, 5),
+            convnext_version=2,
         )
         self.assertEqual(
             reg_suffix,
-            "ARR1-2-3-0-0_ARR2-4-5-0-0_REG-1-0-0-0_NREG-2-3-4-5",
+            "convnextV2_ARR1-2-3-0-0_ARR2-4-5-0-0_REG-1-0-0-0_NREG-2-3-4-5",
         )
         args = parse_args([
             "--reg-mode", "1,0,0,0",
@@ -87,6 +128,7 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
             model.stage_repeats,
             (1, 0, 0, 0),
             (2, 3, 4, 5),
+            convnext_version=2,
             delta_mode=True,
             reg_head=True,
         )
@@ -151,6 +193,22 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         )
         self.assertFalse(registered_config["paper_model_exact"])
         self.assertEqual(registered_config["architecture"]["register_applications"], 1)
+        self.assertTrue(
+            registered_config["architecture"]["register_attention_drop_path"]
+        )
+        self.assertTrue(registered_config["architecture"]["register_mlp_drop_path"])
+        self.assertEqual(
+            registered_config["architecture"]["register_attention_drop_path_schedule"],
+            "stage_terminal_unrolled_linear",
+        )
+        self.assertEqual(
+            registered_config["architecture"]["register_attention_drop_path_rates"],
+            [0.0],
+        )
+        self.assertEqual(
+            registered_config["architecture"]["register_mlp_drop_path_rates"],
+            [0.0],
+        )
 
     def test_optimizer_loss_and_update_scheduler(self):
         args = parse_args([
@@ -195,7 +253,9 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
                         )
 
             output_base = root / "output"
-            architecture = "ARR1-1-0-0-0_ARR2-1-0-0-0"
+            architecture = (
+                "convnextV2_ARR1-1-0-0-0_ARR2-1-0-0-0_REG-0-0-0-0"
+            )
             output_dir = root / f"output_{architecture}"
             main([
                 "--data-root", str(data_root),
@@ -212,6 +272,7 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
             latest = output_dir / "checkpoint_latest.pt"
             self.assertTrue(latest.is_file())
             self.assertTrue((output_dir / "checkpoint_best.pt").is_file())
+            self.assertTrue((output_dir / "checkpoint_best_raw.pt").is_file())
             self.assertTrue((output_dir / "checkpoint_final.pt").is_file())
             config = json.loads((output_dir / "config.json").read_text())
             self.assertFalse(config["training_recipe_exact"])
@@ -224,6 +285,9 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
             record = json.loads(records[0])
             self.assertIn("raw", record)
             self.assertIn("ema", record)
+            self.assertEqual(record["best_raw_acc1"], record["raw"]["acc1"])
+            checkpoint = torch.load(latest, map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["best_raw_acc1"], record["raw"]["acc1"])
 
             main([
                 "--data-root", str(data_root),
@@ -248,6 +312,7 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
 
             legacy_path = output_dir / "checkpoint_legacy_v6.pt"
             legacy = torch.load(latest, map_location="cpu", weights_only=False)
+            legacy.pop("best_raw_acc1")
             legacy["arguments"].pop("reg_mode")
             legacy["arguments"].pop("n_reg")
             for key in (
@@ -283,7 +348,7 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
             ])
 
             register_architecture = (
-                "ARR1-1-0-0-0_ARR2-1-0-0-0_"
+                "convnextV2_ARR1-1-0-0-0_ARR2-1-0-0-0_"
                 "REG-1-0-0-0_NREG-2-8-8-8"
             )
             register_output = root / f"register_output_{register_architecture}"

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=imagenet-recurrent-cnn
-#SBATCH --partition=h100,a100,nvl,l40s
-#SBATCH --exclude=h04,h10,n06,n15,l06
-#SBATCH --gres=gpu:2
+#SBATCH --partition=h100,a100,l40s
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
@@ -26,6 +25,9 @@ export REG_MODE="${REG_MODE:-0,0,1,0}"
 export N_REG="${N_REG:-8,8,64,8}"
 export DELTA_MODE="${DELTA_MODE:-0}"
 export REG_HEAD="${REG_HEAD:-0}"
+export DELTA_BACKEND="${DELTA_BACKEND:-auto}"
+export DELTA_REQUIRE_FLA="${DELTA_REQUIRE_FLA:-1}"
+export DELTA_CHUNK_SIZE="${DELTA_CHUNK_SIZE:-64}"
 export V="${V:-2}"
 if [[ "${V}" != "1" && "${V}" != "2" ]]; then
     echo "V must be 1 or 2, got ${V}" >&2
@@ -51,6 +53,18 @@ if [[ ! "${DELTA_MODE}" =~ ^[01]$ || ! "${REG_HEAD}" =~ ^[01]$ ]]; then
     echo "DELTA_MODE and REG_HEAD must each be 0 or 1" >&2
     exit 1
 fi
+if [[ ! "${DELTA_REQUIRE_FLA}" =~ ^[01]$ ]]; then
+    echo "DELTA_REQUIRE_FLA must be 0 or 1" >&2
+    exit 1
+fi
+if [[ "${DELTA_BACKEND}" != "auto" && "${DELTA_BACKEND}" != "fla" && "${DELTA_BACKEND}" != "chunk" && "${DELTA_BACKEND}" != "fused_recurrent" && "${DELTA_BACKEND}" != "naive" ]]; then
+    echo "Unsupported DELTA_BACKEND=${DELTA_BACKEND}; use auto, fla, chunk, fused_recurrent, or naive" >&2
+    exit 1
+fi
+if [[ "${DELTA_CHUNK_SIZE}" != "16" && "${DELTA_CHUNK_SIZE}" != "32" && "${DELTA_CHUNK_SIZE}" != "64" ]]; then
+    echo "DELTA_CHUNK_SIZE must be 16, 32, or 64" >&2
+    exit 1
+fi
 
 export DATA_ROOT="${DATA_ROOT:-/cis/project/peq_project/imagenet-1k}"
 export IMG="${IMG:-224}"
@@ -60,8 +74,8 @@ export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 export WORKERS="${WORKERS:-4}"
 export MAX_LR="${MAX_LR:-5e-4}"
 export MIN_LR="${MIN_LR:-1e-6}"
-export EPOCHS="${EPOCHS:-100}"
-export WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
+export EPOCHS="${EPOCHS:-22}"
+export WARMUP_EPOCHS="${WARMUP_EPOCHS:-2}"
 export SEEDS="${SEEDS:-0}"
 export AMP="${AMP:-1}"
 export AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
@@ -103,13 +117,25 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
 
+# Triton caches native helper libraries. Isolate them by node and glibc ABI so
+# jobs never load a cuda_utils.so compiled on an incompatible cluster node.
+GLIBC_VERSION="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+GLIBC_VERSION="${GLIBC_VERSION#glibc }"
+GLIBC_VERSION="${GLIBC_VERSION:-unknown}"
+TRITON_CACHE_NODE="${HOSTNAME:-unknown-host}"
+TRITON_CACHE_ROOT="${XDG_CACHE_HOME:-${HOME}/.cache}/triton"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TRITON_CACHE_ROOT}/${TRITON_CACHE_NODE}-glibc${GLIBC_VERSION}}"
+mkdir -p -- "${TRITON_CACHE_DIR}"
+
 if [[ "${REQUIRE_CUDA}" == "1" ]]; then
     "${PYTHON_BIN}" -c 'import os, torch; count=torch.cuda.device_count(); expected=int(os.environ["GPUS_PER_NODE"]); assert torch.cuda.is_available() and count >= expected, "CUDA preflight failed: available={} count={} expected={} CUDA_VISIBLE_DEVICES={}".format(torch.cuda.is_available(), count, expected, os.environ.get("CUDA_VISIBLE_DEVICES")); [torch.empty(1, device=f"cuda:{i}") for i in range(expected)]; torch.cuda.synchronize(); print(f"cuda_preflight=ok torch={torch.__version__} visible_gpus={[torch.cuda.get_device_name(i) for i in range(count)]}")'
 fi
 
 echo "node=${SLURMD_NODENAME:-none} job_id=${SLURM_JOB_ID:-none}"
 echo "python_bin=${PYTHON_BIN} cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-none} gpus=${GPUS_PER_NODE}"
+echo "triton_cache_dir=${TRITON_CACHE_DIR}"
 echo "model=convnext V=${V} ARR1=${ARR1} ARR2=${ARR2} REG_MODE=${REG_MODE} N_REG=${N_REG} DELTA_MODE=${DELTA_MODE} REG_HEAD=${REG_HEAD} architecture=four_stage_array_tied activation_checkpointing=0"
+echo "delta_backend=${DELTA_BACKEND} delta_require_fla=${DELTA_REQUIRE_FLA} delta_chunk_size=${DELTA_CHUNK_SIZE}"
 echo "epochs=${EPOCHS} BS_per_gpu=${BS} accum=${GRAD_ACCUM_STEPS} workers_per_rank=${WORKERS} OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 echo "progress=${PROGRESS} dataloader_timeout=${DATALOADER_TIMEOUT}s nccl_trace_buffer=${TORCH_NCCL_TRACE_BUFFER_SIZE}"
 echo "max_lr=${MAX_LR} min_lr=${MIN_LR} warmup_epochs=${WARMUP_EPOCHS}"

@@ -11,7 +11,7 @@
 BS=128 ATTN=sequential CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 bash scripts/run_imagenet_delta_peq.sh
 
 # cnn run
-REG_HEAD=0 BS=128 GRAD_ACCUM_STEPS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 bash scripts/run_imagenet_recurrent_cnn.sh
+BS=128 GRAD_ACCUM_STEPS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 bash scripts/run_imagenet_recurrent_cnn.sh
 
 # timm pretrain
 CUDA_VISIBLE_DEVICES=0,1 GPUS_PER_NODE=2 bash scripts/run_peq_timm_pretrain.sh

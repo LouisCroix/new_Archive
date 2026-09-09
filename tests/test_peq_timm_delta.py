@@ -1,6 +1,7 @@
 import unittest
 from dataclasses import asdict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -19,6 +20,7 @@ from peq_timm_common import (
     training_name_suffix,
     train_one_epoch,
     validate_checkpoint_compatibility,
+    validate_model_runtime,
     wandb_project_name,
 )
 
@@ -86,6 +88,17 @@ class DeltaPeqModelTests(unittest.TestCase):
         for override in invalid:
             with self.subTest(override=override), self.assertRaises(ValueError):
                 tiny_config(**override)
+
+    def test_auto_cuda_backend_requires_fla_during_preflight(self):
+        args = SimpleNamespace(device=torch.device("cuda"), amp=True)
+        with patch("peq_timm_common.require_fla") as mocked_require_fla:
+            validate_model_runtime(args, tiny_config(delta_backend="auto"))
+        mocked_require_fla.assert_called_once_with()
+
+    def test_auto_cuda_backend_requires_amp_during_preflight(self):
+        args = SimpleNamespace(device=torch.device("cuda"), amp=False)
+        with self.assertRaisesRegex(ValueError, "requires --amp"):
+            validate_model_runtime(args, tiny_config(delta_backend="auto"))
 
     def test_training_loop_protocol_is_unchanged(self):
         model = Net(tiny_config(mode="tied"))

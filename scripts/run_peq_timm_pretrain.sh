@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=peq-pretrain
 #SBATCH --partition=h100,a100
-#SBATCH --exclude=h04,h10,n06,n15,l06
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16

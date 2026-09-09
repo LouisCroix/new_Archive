@@ -1388,8 +1388,16 @@ def wandb_project_name(
 
 def validate_model_runtime(args, cfg: ModelConfig) -> None:
     explicit_fla = cfg.delta_backend in {"fla", "chunk", "fused_recurrent"}
-    if explicit_fla:
+    auto_cuda = cfg.delta_backend == "auto" and args.device.type == "cuda"
+    if auto_cuda and not args.amp:
+        raise ValueError(
+            "delta_backend=auto on CUDA requires --amp; use delta_backend=naive "
+            "explicitly for the readable recurrence"
+        )
+    auto_accelerated = auto_cuda and args.amp
+    if explicit_fla or auto_accelerated:
         require_fla()
+    if explicit_fla:
         if args.device.type != "cuda":
             raise RuntimeError(f"delta_backend={cfg.delta_backend} requires CUDA")
     if cfg.delta_backend in {"fla", "chunk"} and not args.amp:

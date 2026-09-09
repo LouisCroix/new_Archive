@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torchvision.models.convnext import CNBlock, LayerNorm2d
 
+import deltanet
 from deltanet import DeltaNet
 from recurrent_cnn import (
     ConvNeXtV2Block,
@@ -359,6 +360,100 @@ class RecurrentCNNTest(unittest.TestCase):
         self.assertEqual([len(stage.drop_path_probs) for stage in stages], [3, 3, 12])
         self.assertEqual(len(set(stages[0].drop_path_probs)), 3)
         self.assertEqual(len(set(stages[2].drop_path_probs)), 12)
+
+    def test_register_attention_uses_stage_terminal_drop_path_rate(self):
+        model = RecurrentCNN(
+            (2, 0, 0, 0),
+            (2, 0, 0, 0),
+            num_classes=3,
+            convnext_version=2,
+            drop_path_rate=0.3,
+            reg_mode=(1, 0, 0, 0),
+            n_reg=(2, 8, 8, 8),
+        )
+        stage = model.features[0]
+        for actual, expected in zip(stage.register_drop_path_probs, (0.1, 0.3)):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(model.register_drop_path_rates, (0.1, 0.3)):
+            self.assertAlmostEqual(actual, expected)
+
+        probabilities = []
+
+        def identity_drop_path(inputs, probability, mode, training):
+            probabilities.append((float(probability), mode, training, inputs.ndim))
+            return inputs
+
+        with patch("recurrent_cnn.stochastic_depth", side_effect=identity_drop_path):
+            model(torch.randn(1, 3, 32, 32))
+
+        # Each repeat has two ConvNeXt residuals followed by the three RATS
+        # attention residuals (compress, refine, broadcast) and the MLP residual.
+        expected = [
+            0.0, 0.1, 0.1, 0.1, 0.1, 0.1,
+            0.2, 0.3, 0.3, 0.3, 0.3, 0.3,
+        ]
+        self.assertEqual(len(probabilities), len(expected))
+        for actual, expected_item in zip(
+            [item[0] for item in probabilities], expected
+        ):
+            self.assertAlmostEqual(actual, expected_item)
+        self.assertTrue(all(mode == "row" for _, mode, _, _ in probabilities))
+        self.assertTrue(all(training for _, _, training, _ in probabilities))
+
+    def test_delta_attention_residual_also_uses_register_drop_path(self):
+        block = RATSRegisterBlock(12, 2, heads=3, delta_mode=True)
+        inputs = torch.randn(1, 12, 2, 2)
+        registers = block.initial_registers(1)
+        probabilities = []
+
+        def identity_drop_path(value, probability, mode, training):
+            probabilities.append(float(probability))
+            return value
+
+        with patch("recurrent_cnn.stochastic_depth", side_effect=identity_drop_path):
+            block(inputs, registers, stochastic_depth_prob=0.25)
+        self.assertEqual(probabilities, [0.25, 0.25, 0.25, 0.25, 0.25])
+
+    def test_auto_cuda_backend_refuses_memory_heavy_fallback(self):
+        key = type(
+            "CudaKey",
+            (),
+            {
+                "is_cuda": True,
+                "dtype": torch.bfloat16,
+                "shape": (1, 1, 65, 1),
+            },
+        )()
+        with patch.object(
+            deltanet, "_load_fla_ops", side_effect=RuntimeError("broken FLA")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Refusing to fall back"):
+                deltanet._resolve_backend("auto", key)
+
+    def test_auto_cpu_backend_keeps_readable_naive_path(self):
+        key = type(
+            "CpuKey",
+            (),
+            {
+                "is_cuda": False,
+                "dtype": torch.float32,
+                "shape": (1, 1, 4, 1),
+            },
+        )()
+        self.assertEqual(deltanet._resolve_backend("auto", key), "naive")
+
+    def test_auto_cuda_float32_refuses_memory_heavy_fallback(self):
+        key = type(
+            "CudaFloatKey",
+            (),
+            {
+                "is_cuda": True,
+                "dtype": torch.float32,
+                "shape": (1, 1, 4, 1),
+            },
+        )()
+        with self.assertRaisesRegex(RuntimeError, "requires AMP"):
+            deltanet._resolve_backend("auto", key)
 
     def test_drop_path_preserves_state_dict_and_eval_outputs(self):
         plain = RecurrentCNN((1, 1, 1, 0), (2, 2, 2, 0), num_classes=10).eval()

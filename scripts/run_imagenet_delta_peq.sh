@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=imagenet_delta_peq
-#SBATCH --partition=h100,a100,nvl,l40s
-#SBATCH --exclude=h04,h10,n06,n15,l06
+#SBATCH --partition=h100,a100,l40s
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -78,7 +77,7 @@ export AMP="${AMP:-1}"
 export PROGRESS="${PROGRESS:-1}"
 export MEMORY_PROBE="${MEMORY_PROBE:-0}"
 export AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
-export GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 export REQUIRE_CUDA="${REQUIRE_CUDA:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=convnext-official-300
-#SBATCH --partition=h100,a100,nvl,l40s
-#SBATCH --exclude=h04,h10,n06,n15,l06
-#SBATCH --gres=gpu:4
+#SBATCH --partition=h100,a100,l40s
+#SBATCH --gres=gpu:2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
@@ -19,18 +18,22 @@ PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
 DATA_ROOT="${DATA_ROOT:-/cis/project/peq_project/imagenet-1k}"
 
 V="${V:-2}"
-ARR1="${ARR1:-1,1,2,0}"
+ARR1="${ARR1:-1,1,1,0}"
 ARR2="${ARR2:-3,3,6,0}"
-REG_MODE="${REG_MODE:-0,0,0,0}"
-N_REG="${N_REG:-8,8,8,8}"
+REG_MODE="${REG_MODE:-0,0,1,0}"
+N_REG="${N_REG:-8,8,64,8}"
 DELTA_MODE="${DELTA_MODE:-0}"
-REG_HEAD="${REG_HEAD:-1}"
+REG_HEAD="${REG_HEAD:-0}"
+export DELTA_BACKEND="${DELTA_BACKEND:-fla}"
+export DELTA_CHUNK_SIZE="${DELTA_CHUNK_SIZE:-64}"
 DROP_PATH_RATE="${DROP_PATH_RATE:-0.1}"
 EPOCHS="${EPOCHS:-300}"
 WARMUP_EPOCHS="${WARMUP_EPOCHS:-20}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 BS_PER_GPU="${BS_PER_GPU:-128}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4096}"
+BASE_LR="${BASE_LR:-4e-3}"
+REFERENCE_BATCH_SIZE="${REFERENCE_BATCH_SIZE:-4096}"
 WORKERS="${WORKERS:-8}"
 SEED="${SEED:-0}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
@@ -69,6 +72,14 @@ if [[ ! "${DELTA_MODE}" =~ ^[01]$ || ! "${REG_HEAD}" =~ ^[01]$ ]]; then
     echo "DELTA_MODE and REG_HEAD must each be 0 or 1" >&2
     exit 1
 fi
+if [[ "${DELTA_BACKEND}" != "auto" && "${DELTA_BACKEND}" != "fla" && "${DELTA_BACKEND}" != "chunk" && "${DELTA_BACKEND}" != "fused_recurrent" && "${DELTA_BACKEND}" != "naive" ]]; then
+    echo "Unsupported DELTA_BACKEND=${DELTA_BACKEND}; use auto, fla, chunk, fused_recurrent, or naive" >&2
+    exit 1
+fi
+if [[ "${DELTA_CHUNK_SIZE}" != "16" && "${DELTA_CHUNK_SIZE}" != "32" && "${DELTA_CHUNK_SIZE}" != "64" ]]; then
+    echo "DELTA_CHUNK_SIZE must be 16, 32, or 64" >&2
+    exit 1
+fi
 if (( GPUS_PER_NODE < 1 || BS_PER_GPU < 1 || GLOBAL_BATCH_SIZE < 1 )); then
     echo "GPUS_PER_NODE, BS_PER_GPU, and GLOBAL_BATCH_SIZE must be positive" >&2
     exit 1
@@ -81,11 +92,6 @@ if ! [[ "${WARMUP_EPOCHS}" =~ ^[0-9]+$ ]] || (( 10#${WARMUP_EPOCHS} > 10#${EPOCH
     echo "WARMUP_EPOCHS must be an integer in [0, EPOCHS], got ${WARMUP_EPOCHS}" >&2
     exit 1
 fi
-if (( GLOBAL_BATCH_SIZE != 4096 )); then
-    echo "The strict official recipe requires GLOBAL_BATCH_SIZE=4096" >&2
-    exit 1
-fi
-
 MICRO_GLOBAL_BATCH=$((GPUS_PER_NODE * BS_PER_GPU))
 if [[ -n "${GRAD_ACCUM_STEPS:-}" ]]; then
     GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS}"
@@ -105,14 +111,15 @@ if (( EFFECTIVE_BATCH_SIZE != GLOBAL_BATCH_SIZE )); then
     echo "Effective batch ${EFFECTIVE_BATCH_SIZE} does not equal requested GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}" >&2
     exit 1
 fi
+PEAK_LR="$(awk -v base_lr="${BASE_LR}" -v batch_size="${EFFECTIVE_BATCH_SIZE}" -v reference_batch_size="${REFERENCE_BATCH_SIZE}" 'BEGIN { printf "%.10g", base_lr * batch_size / reference_batch_size }')"
 
 ARR1_SLUG="${ARR1//,/-}"
 ARR2_SLUG="${ARR2//,/-}"
 REG_MODE_SLUG="${REG_MODE//,/-}"
 N_REG_SLUG="${N_REG//,/-}"
-REG_SUFFIX=""
+REG_SUFFIX="_REG-${REG_MODE_SLUG}"
 if [[ "${REG_MODE}" != "0,0,0,0" ]]; then
-    REG_SUFFIX="_REG-${REG_MODE_SLUG}_NREG-${N_REG_SLUG}"
+    REG_SUFFIX+="_NREG-${N_REG_SLUG}"
 fi
 if [[ "${DELTA_MODE}" == "1" ]]; then
     REG_SUFFIX+="_DELTA1"
@@ -121,8 +128,8 @@ if [[ "${REG_HEAD}" == "1" ]]; then
     REG_SUFFIX+="_REGHEAD1"
 fi
 RUN_SCHEDULE_SLUG="ep${EPOCHS}_warmup${WARMUP_EPOCHS}"
-WANDB_NAME="${WANDB_NAME:-convnext-official-ep${EPOCHS}-warmup${WARMUP_EPOCHS}}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_recurrent_official_convnextV${V}_ARR1-${ARR1_SLUG}_ARR2-${ARR2_SLUG}${REG_SUFFIX}_${RUN_SCHEDULE_SLUG}_gbs${GLOBAL_BATCH_SIZE}_seed${SEED}}"
+WANDB_NAME="${WANDB_NAME:-convnext-official-ep${EPOCHS}-warmup${WARMUP_EPOCHS}-gbs${EFFECTIVE_BATCH_SIZE}-maxlr${PEAK_LR}}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_recurrent_official_convnextV${V}_ARR1-${ARR1_SLUG}_ARR2-${ARR2_SLUG}${REG_SUFFIX}_${RUN_SCHEDULE_SLUG}_gbs${EFFECTIVE_BATCH_SIZE}_maxlr${PEAK_LR}_seed${SEED}}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2
@@ -144,6 +151,16 @@ export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
 export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
 
+# Triton caches native helper libraries. Isolate them by node and glibc ABI so
+# jobs never load a cuda_utils.so compiled on an incompatible cluster node.
+GLIBC_VERSION="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+GLIBC_VERSION="${GLIBC_VERSION#glibc }"
+GLIBC_VERSION="${GLIBC_VERSION:-unknown}"
+TRITON_CACHE_NODE="${HOSTNAME:-unknown-host}"
+TRITON_CACHE_ROOT="${XDG_CACHE_HOME:-${HOME}/.cache}/triton"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TRITON_CACHE_ROOT}/${TRITON_CACHE_NODE}-glibc${GLIBC_VERSION}}"
+mkdir -p -- "${TRITON_CACHE_DIR}"
+
 TRAIN_ARGS=(
     --data-root "${DATA_ROOT}"
     --output-dir "${OUTPUT_DIR}"
@@ -159,8 +176,8 @@ TRAIN_ARGS=(
     --seed "${SEED}"
     --epochs "${EPOCHS}"
     --warmup-epochs "${WARMUP_EPOCHS}"
-    --base-lr 4e-3
-    --reference-batch-size 4096
+    --base-lr "${BASE_LR}"
+    --reference-batch-size "${REFERENCE_BATCH_SIZE}"
     --warmup-lr 1e-6
     --min-lr 1e-6
     --weight-decay 0.05
@@ -187,7 +204,7 @@ fi
 if [[ "${REG_HEAD}" == "1" ]]; then
     TRAIN_ARGS+=(--reg-head)
 fi
-if (( 10#${EPOCHS} == 300 && 10#${WARMUP_EPOCHS} == 20 )); then
+if (( 10#${EPOCHS} == 300 && 10#${WARMUP_EPOCHS} == 20 && GLOBAL_BATCH_SIZE == 4096 )); then
     TRAIN_ARGS+=(--strict-official-recipe)
 else
     TRAIN_ARGS+=(--no-strict-official-recipe)
@@ -207,13 +224,14 @@ COMMAND=(
 )
 
 echo "model=convnext V=${V} ARR1=${ARR1} ARR2=${ARR2} REG_MODE=${REG_MODE} N_REG=${N_REG} DELTA_MODE=${DELTA_MODE} REG_HEAD=${REG_HEAD} drop_path_rate=${DROP_PATH_RATE}"
+echo "delta_backend=${DELTA_BACKEND} delta_chunk_size=${DELTA_CHUNK_SIZE} triton_cache_dir=${TRITON_CACHE_DIR}"
 echo "gpus=${GPUS_PER_NODE} batch_per_gpu=${BS_PER_GPU} accum=${GRAD_ACCUM_STEPS} effective_batch_size=${EFFECTIVE_BATCH_SIZE}"
-if (( 10#${EPOCHS} == 300 && 10#${WARMUP_EPOCHS} == 20 )); then
+if (( 10#${EPOCHS} == 300 && 10#${WARMUP_EPOCHS} == 20 && GLOBAL_BATCH_SIZE == 4096 )); then
     RECIPE_EXACT=1
 else
     RECIPE_EXACT=0
 fi
-echo "epochs=${EPOCHS} warmup_epochs=${WARMUP_EPOCHS} peak_lr=4e-3 min_lr=1e-6 recipe_exact=${RECIPE_EXACT}"
+echo "epochs=${EPOCHS} warmup_epochs=${WARMUP_EPOCHS} peak_lr=${PEAK_LR} min_lr=1e-6 recipe_exact=${RECIPE_EXACT}"
 echo "amp_dtype=${AMP_DTYPE} wandb_mode=${WANDB_MODE} output_dir=${OUTPUT_DIR} resume=${RESUME:-none}"
 
 if [[ "${DRY_RUN}" == "1" ]]; then

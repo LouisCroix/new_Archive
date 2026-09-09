@@ -299,7 +299,14 @@ if DELTA_CHUNK_SIZE not in {16, 32, 64}:
     raise ValueError("DELTA_CHUNK_SIZE must be 16, 32, or 64")
 if DELTA_BACKEND in {"fla", "chunk"} and not use_amp:
     raise ValueError(f"DELTA_BACKEND={DELTA_BACKEND} requires AMP=1")
-if DELTA_BACKEND in {"fla", "chunk", "fused_recurrent"}:
+if DELTA_BACKEND == "auto" and device_type == "cuda" and not use_amp:
+    raise ValueError(
+        "DELTA_BACKEND=auto on CUDA requires AMP=1; set DELTA_BACKEND=naive "
+        "explicitly for the readable recurrence"
+    )
+if DELTA_BACKEND in {"fla", "chunk", "fused_recurrent"} or (
+    DELTA_BACKEND == "auto" and device_type == "cuda" and use_amp
+):
     require_fla()
 DATA_ROOT = os.environ.get("DATA_ROOT", "/cis/home/cyang140/datasets/imagenet")
 IMG = int(os.environ.get("IMG", 128))

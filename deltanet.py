@@ -1,7 +1,5 @@
 """Delta attention modules with readable and official FLA execution backends."""
 
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +9,6 @@ DELTA_BACKENDS = {"auto", "naive", "fla", "chunk", "fused_recurrent"}
 _FLA_OPS = None
 _FLA_SHORT_CONV = None
 _FLA_IMPORT_ERROR = None
-_FLA_FALLBACK_WARNED = False
 
 
 def _load_fla_ops():
@@ -20,16 +17,18 @@ def _load_fla_ops():
         return _FLA_OPS
     if _FLA_IMPORT_ERROR is not None:
         raise RuntimeError(
-            "The official FLA DeltaNet backend is unavailable. Install fla-core "
-            "and einops in the training environment."
+            "The official FLA DeltaNet backend is unavailable. Verify fla-core, "
+            "einops, Triton/CUDA compatibility, and use a node/glibc-specific "
+            "TRITON_CACHE_DIR."
         ) from _FLA_IMPORT_ERROR
     try:
         from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
     except (ImportError, OSError) as exc:
         _FLA_IMPORT_ERROR = exc
         raise RuntimeError(
-            "The official FLA DeltaNet backend is unavailable. Install fla-core "
-            "and einops in the training environment."
+            "The official FLA DeltaNet backend is unavailable. Verify fla-core, "
+            "einops, Triton/CUDA compatibility, and use a node/glibc-specific "
+            "TRITON_CACHE_DIR."
         ) from exc
     _FLA_OPS = (chunk_delta_rule, fused_recurrent_delta_rule)
     return _FLA_OPS
@@ -161,26 +160,29 @@ def _naive_delta_output(query, key, value, beta, cross_attention):
 
 
 def _resolve_backend(backend, key):
-    global _FLA_FALLBACK_WARNED
     if backend not in DELTA_BACKENDS:
         options = ", ".join(sorted(DELTA_BACKENDS))
         raise ValueError(f"Unsupported Delta backend={backend}; use {options}")
     if backend == "naive":
         return "naive"
     if backend == "auto":
-        if not key.is_cuda or key.dtype == torch.float32:
+        if not key.is_cuda:
             return "naive"
+        if key.dtype == torch.float32:
+            raise RuntimeError(
+                "DELTA_BACKEND=auto on CUDA requires AMP float16/bfloat16. "
+                "Refusing to select the memory-heavy naive recurrence; enable "
+                "AMP or request DELTA_BACKEND=naive explicitly."
+            )
         try:
             _load_fla_ops()
-        except RuntimeError:
-            if not _FLA_FALLBACK_WARNED:
-                warnings.warn(
-                    "FLA is unavailable; DELTA_BACKEND=auto is using the memory-heavy "
-                    "naive recurrence.",
-                    stacklevel=3,
-                )
-                _FLA_FALLBACK_WARNED = True
-            return "naive"
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "DELTA_BACKEND=auto selected the accelerated CUDA path, but FLA "
+                "could not be loaded. Refusing to fall back to the memory-heavy "
+                "naive recurrence; repair the FLA/Triton environment or request "
+                "DELTA_BACKEND=naive explicitly."
+            ) from exc
         return "fused_recurrent" if key.shape[2] <= 64 else "chunk"
     if not key.is_cuda:
         raise RuntimeError(f"DELTA_BACKEND={backend} requires CUDA tensors")
