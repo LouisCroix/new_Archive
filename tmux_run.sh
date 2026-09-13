@@ -4,7 +4,6 @@
 salloc \
   --job-name=intr1 \
   --partition=h100,a100 \
-  --exclude=h04,h10,n06,n15,l06 \
   --gres=gpu:1 \
   --cpus-per-task=16 \
   --mem=64G \

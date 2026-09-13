@@ -862,7 +862,10 @@ def main():
             return torch.autocast(device_type=device_type, dtype=amp_dtype)
         return nullcontext()
 
-    data_root = os.environ.get("DATA_ROOT", "/cis/project/peq_project/imagenet-1k")
+    data_root = os.environ.get(
+        "DATA_ROOT",
+        "/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet",
+    )
     img = int(os.environ.get("IMG", 224))
     resize = int(os.environ.get("RESIZE", 256))
     epochs = int(os.environ.get("EPOCHS", 22))

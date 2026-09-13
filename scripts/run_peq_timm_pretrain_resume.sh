@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=peq-pre-resume
-#SBATCH --partition=h100,a100
+#SBATCH --account=abhatt40_viztac
+#SBATCH --qos=normal
+#SBATCH --partition=h200,h100,a100
+#SBATCH --exclude=gh102
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
+#SBATCH --comment=accept_cost
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -18,8 +22,8 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$(dirname -- "${SCRIPT_DIR}")}}"
-export DATA_ROOT="${DATA_ROOT:-/cis/project/peq_project/imagenet-1k}"
-export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
+export DATA_ROOT="${DATA_ROOT:-/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet}"
+export PYTHON_BIN="${PYTHON_BIN:-/home/jhu/cyang140/.conda/envs/peq-fla/bin/python}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 

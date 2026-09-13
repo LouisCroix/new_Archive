@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=imagenet-recurrent-cnn
-#SBATCH --partition=h100,a100,l40s
+#SBATCH --account=abhatt40_viztac
+#SBATCH --qos=normal
+#SBATCH --partition=h200,h100,a100
+#SBATCH --exclude=gh102
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
+#SBATCH --comment=accept_cost
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -19,9 +23,9 @@ cd "${PROJECT_ROOT}"
 # ARR1 is the number of unique blocks in each native ConvNeXt stage. ARR2 is
 # the number of times the complete stage is repeated with shared parameters.
 # V=1 uses the current ConvNeXt block; V=2 uses ConvNeXt V2 with GRN.
-export ARR1="${ARR1:-1,1,1,0}"
-export ARR2="${ARR2:-3,3,6,0}"
-export REG_MODE="${REG_MODE:-0,0,1,0}"
+export ARR1="${ARR1:-3,3,3,0}"
+export ARR2="${ARR2:-1,1,4,0}"
+export REG_MODE="${REG_MODE:-0,0,0,0}"
 export N_REG="${N_REG:-8,8,64,8}"
 export DELTA_MODE="${DELTA_MODE:-0}"
 export REG_HEAD="${REG_HEAD:-0}"
@@ -53,20 +57,8 @@ if [[ ! "${DELTA_MODE}" =~ ^[01]$ || ! "${REG_HEAD}" =~ ^[01]$ ]]; then
     echo "DELTA_MODE and REG_HEAD must each be 0 or 1" >&2
     exit 1
 fi
-if [[ ! "${DELTA_REQUIRE_FLA}" =~ ^[01]$ ]]; then
-    echo "DELTA_REQUIRE_FLA must be 0 or 1" >&2
-    exit 1
-fi
-if [[ "${DELTA_BACKEND}" != "auto" && "${DELTA_BACKEND}" != "fla" && "${DELTA_BACKEND}" != "chunk" && "${DELTA_BACKEND}" != "fused_recurrent" && "${DELTA_BACKEND}" != "naive" ]]; then
-    echo "Unsupported DELTA_BACKEND=${DELTA_BACKEND}; use auto, fla, chunk, fused_recurrent, or naive" >&2
-    exit 1
-fi
-if [[ "${DELTA_CHUNK_SIZE}" != "16" && "${DELTA_CHUNK_SIZE}" != "32" && "${DELTA_CHUNK_SIZE}" != "64" ]]; then
-    echo "DELTA_CHUNK_SIZE must be 16, 32, or 64" >&2
-    exit 1
-fi
 
-export DATA_ROOT="${DATA_ROOT:-/cis/project/peq_project/imagenet-1k}"
+export DATA_ROOT="${DATA_ROOT:-/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet}"
 export IMG="${IMG:-224}"
 export RESIZE="${RESIZE:-256}"
 export BS="${BS:-512}"
@@ -109,7 +101,7 @@ if [[ "${REG_HEAD}" == "1" ]]; then
     EXPERIMENT_VERSION=8
 fi
 export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_recurrent_v${EXPERIMENT_VERSION}_convnextV${V}_ARR1-${ARR1_SLUG}_ARR2-${ARR2_SLUG}${REG_SUFFIX}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_lr${MAX_LR}_minlr${MIN_LR}}"
-export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
+export PYTHON_BIN="${PYTHON_BIN:-/home/jhu/cyang140/.conda/envs/peq-fla/bin/python}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2

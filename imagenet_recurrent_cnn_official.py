@@ -169,7 +169,10 @@ def parse_args(argv: Optional[list[str]] = None):
     parser.add_argument("--convnext-version", type=int, choices=(1, 2), default=2)
     parser.add_argument("--drop-path-rate", type=float, default=OFFICIAL_RECIPE["drop_path_rate"])
 
-    parser.add_argument("--data-root", default="/cis/project/peq_project/imagenet-1k")
+    parser.add_argument(
+        "--data-root",
+        default="/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--image-size", type=int, default=OFFICIAL_RECIPE["image_size"])
     parser.add_argument("--batch-size", type=int, default=128, help="per-rank batch size")

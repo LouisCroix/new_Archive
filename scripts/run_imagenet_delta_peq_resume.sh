@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=imagenet-delta-peq-resume
-#SBATCH --partition=h100,a100
+#SBATCH --account=abhatt40_viztac
+#SBATCH --qos=normal
+#SBATCH --partition=h200,h100,a100
+#SBATCH --exclude=gh102
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
+#SBATCH --comment=accept_cost
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -32,7 +36,7 @@ export REQUIRE_CUDA="${REQUIRE_CUDA:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PROGRESS="${PROGRESS:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
+export PYTHON_BIN="${PYTHON_BIN:-/home/jhu/cyang140/.conda/envs/peq-fla/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2
     exit 1

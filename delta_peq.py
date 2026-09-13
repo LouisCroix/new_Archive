@@ -308,7 +308,10 @@ if DELTA_BACKEND in {"fla", "chunk", "fused_recurrent"} or (
     DELTA_BACKEND == "auto" and device_type == "cuda" and use_amp
 ):
     require_fla()
-DATA_ROOT = os.environ.get("DATA_ROOT", "/cis/home/cyang140/datasets/imagenet")
+DATA_ROOT = os.environ.get(
+    "DATA_ROOT",
+    "/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet",
+)
 IMG = int(os.environ.get("IMG", 128))
 RESIZE = int(os.environ.get("RESIZE", round(IMG * 146 / 128)))
 L = (IMG // PATCH) ** 2

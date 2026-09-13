@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=imagenet_delta_peq
-#SBATCH --partition=h100,a100,l40s
+#SBATCH --account=abhatt40_viztac
+#SBATCH --qos=normal
+#SBATCH --partition=h200,h100,a100
+#SBATCH --exclude=gh102,l40s
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
+#SBATCH --comment=accept_cost
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -16,7 +20,7 @@ DEFAULT_PROJECT_ROOT="$(dirname -- "${SCRIPT_DIR}")"
 export PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-${DEFAULT_PROJECT_ROOT}}}"
 cd "${PROJECT_ROOT}"
 
-export DATA_ROOT="${DATA_ROOT:-/cis/project/peq_project/imagenet-1k}"
+export DATA_ROOT="${DATA_ROOT:-/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet}"
 export IMG="${IMG:-224}"
 export RESIZE="${RESIZE:-256}"
 export D="${D:-384}"
@@ -52,7 +56,7 @@ fi
 export RMSNORM="${RMSNORM:-0}"
 export LAYERSCALE="${LAYERSCALE:-0}"
 export LS_INIT="${LS_INIT:-1e-4}"
-export BS="${BS:-256}"
+export BS="${BS:-512}"
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 export MAX_LR="${MAX_LR:-5e-4}"
 export MIN_LR="${MIN_LR:-1e-6}"
@@ -82,7 +86,7 @@ export REQUIRE_CUDA="${REQUIRE_CUDA:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_deltareg${DELTAREG}_delta_peq_patch${PATCH_ATTN}_${STAGE_LAYOUT}_refine${REFINE_ATTN}_${DELTA_BACKEND_LABEL}_sdpa${SDPA_BACKEND_LABEL}_c${DELTA_CHUNK_SIZE}_skipattn${SKIPATTN}_readout${READOUT}_midout${MIDOUT}_D${D}_NREG${N_REG_LABEL}_T${T}_img${IMG}_epochs${EPOCHS}_BS${BS}_accum${GRAD_ACCUM_STEPS}_rms${RMSNORM}_LS${LAYERSCALE}_lr${MAX_LR}_minlr${MIN_LR}}"
-export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
+export PYTHON_BIN="${PYTHON_BIN:-/home/jhu/cyang140/.conda/envs/peq-fla/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2
     exit 1

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=imagenet-recurrent-cnn-resume
-#SBATCH --partition=h100,a100,l40s
-#SBATCH --gres=gpu:1
+#SBATCH --account=abhatt40_viztac
+#SBATCH --qos=normal
+#SBATCH --partition=h200,h100,a100
+#SBATCH --exclude=gh102,l40s
+#SBATCH --gres=gpu:2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
+#SBATCH --comment=accept_cost
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -40,7 +44,7 @@ export DELTA_CHUNK_SIZE="${DELTA_CHUNK_SIZE:-64}"
 export TORCHRUN_MAX_RESTARTS="${TORCHRUN_MAX_RESTARTS:-2}"
 export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
 export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
-export PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
+export PYTHON_BIN="${PYTHON_BIN:-/home/jhu/cyang140/.conda/envs/peq-fla/bin/python}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2

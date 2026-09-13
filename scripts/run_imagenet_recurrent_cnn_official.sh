@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=convnext-official-300
-#SBATCH --partition=h100,a100,l40s
-#SBATCH --gres=gpu:2
+#SBATCH --account=abhatt40_viztac
+#SBATCH --qos=jhu
+#SBATCH --partition=h200,h100,a100
+#SBATCH --exclude=gh102
+#SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --time=3-00:00:00
+#SBATCH --comment=accept_cost
 #SBATCH --signal=B:USR1@600
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
@@ -14,23 +18,21 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$(dirname -- "${SCRIPT_DIR}")}}"
-PYTHON_BIN="${PYTHON_BIN:-/cis/home/cyang140/.conda/envs/peq-fla/bin/python}"
-DATA_ROOT="${DATA_ROOT:-/cis/project/peq_project/imagenet-1k}"
+PYTHON_BIN="${PYTHON_BIN:-/home/jhu/cyang140/.conda/envs/peq-fla/bin/python}"
+DATA_ROOT="${DATA_ROOT:-/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet}"
 
 V="${V:-2}"
-ARR1="${ARR1:-1,1,1,0}"
-ARR2="${ARR2:-3,3,6,0}"
-REG_MODE="${REG_MODE:-0,0,1,0}"
+ARR1="${ARR1:-3,3,3,1}"
+ARR2="${ARR2:-1,1,3,3}"
+REG_MODE="${REG_MODE:-0,0,0,0}"
 N_REG="${N_REG:-8,8,64,8}"
 DELTA_MODE="${DELTA_MODE:-0}"
 REG_HEAD="${REG_HEAD:-0}"
-export DELTA_BACKEND="${DELTA_BACKEND:-fla}"
-export DELTA_CHUNK_SIZE="${DELTA_CHUNK_SIZE:-64}"
 DROP_PATH_RATE="${DROP_PATH_RATE:-0.1}"
 EPOCHS="${EPOCHS:-300}"
 WARMUP_EPOCHS="${WARMUP_EPOCHS:-20}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
-BS_PER_GPU="${BS_PER_GPU:-128}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+BS_PER_GPU="${BS_PER_GPU:-512}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4096}"
 BASE_LR="${BASE_LR:-4e-3}"
 REFERENCE_BATCH_SIZE="${REFERENCE_BATCH_SIZE:-4096}"
