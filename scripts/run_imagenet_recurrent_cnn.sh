@@ -57,6 +57,18 @@ if [[ ! "${DELTA_MODE}" =~ ^[01]$ || ! "${REG_HEAD}" =~ ^[01]$ ]]; then
     echo "DELTA_MODE and REG_HEAD must each be 0 or 1" >&2
     exit 1
 fi
+if [[ ! "${DELTA_REQUIRE_FLA}" =~ ^[01]$ ]]; then
+    echo "DELTA_REQUIRE_FLA must be 0 or 1" >&2
+    exit 1
+fi
+if [[ "${DELTA_BACKEND}" != "auto" && "${DELTA_BACKEND}" != "fla" && "${DELTA_BACKEND}" != "chunk" && "${DELTA_BACKEND}" != "fused_recurrent" && "${DELTA_BACKEND}" != "naive" ]]; then
+    echo "Unsupported DELTA_BACKEND=${DELTA_BACKEND}; use auto, fla, chunk, fused_recurrent, or naive" >&2
+    exit 1
+fi
+if [[ "${DELTA_CHUNK_SIZE}" != "16" && "${DELTA_CHUNK_SIZE}" != "32" && "${DELTA_CHUNK_SIZE}" != "64" ]]; then
+    echo "DELTA_CHUNK_SIZE must be 16, 32, or 64" >&2
+    exit 1
+fi
 
 export DATA_ROOT="${DATA_ROOT:-/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet}"
 export IMG="${IMG:-224}"

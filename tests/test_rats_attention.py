@@ -27,9 +27,9 @@ def manual_attention(module, stage, query, key, value):
 class RATSAttentionTest(unittest.TestCase):
     def test_all_stages_match_delta_peq_projection_rules(self):
         torch.manual_seed(3)
-        module = RATSAttention(12, heads=3, sdpa_backend="auto")
-        registers = torch.randn(2, 4, 12)
-        features = torch.randn(2, 7, 12)
+        module = RATSAttention(6, heads=2, sdpa_backend="auto")
+        registers = torch.randn(1, 2, 6)
+        features = torch.randn(1, 3, 6)
         operands = {
             "compress": (registers, features, features),
             "refine": (registers, registers, registers),
@@ -45,9 +45,9 @@ class RATSAttentionTest(unittest.TestCase):
                 torch.testing.assert_close(actual_weights, expected_weights)
 
     def test_sdpa_path_shapes_and_backward(self):
-        module = RATSAttention(12, heads=3, sdpa_backend="auto")
-        query = torch.randn(2, 5, 12, requires_grad=True)
-        registers = torch.randn(2, 3, 12, requires_grad=True)
+        module = RATSAttention(6, heads=2, sdpa_backend="auto")
+        query = torch.randn(1, 3, 6, requires_grad=True)
+        registers = torch.randn(1, 2, 6, requires_grad=True)
         output = module("broadcast", query, registers, registers)
         self.assertEqual(output.shape, query.shape)
         output.square().mean().backward()

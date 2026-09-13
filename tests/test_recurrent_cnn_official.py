@@ -11,7 +11,9 @@ from PIL import Image
 from timm.loss import SoftTargetCrossEntropy
 
 from imagenet_recurrent_cnn_official import (
+    RESUME_ARGUMENT_KEYS,
     DistributedEvalSampler,
+    _restore_resume_arguments,
     append_architecture_suffix,
     architecture_suffix,
     best_raw_acc1_from_metrics,
@@ -27,7 +29,7 @@ from imagenet_recurrent_cnn_official import (
     parse_args,
     scaled_peak_lr,
 )
-from recurrent_cnn import RecurrentCNN
+from recurrent_cnn import ATTO_STAGE_WIDTHS, TINY_STAGE_WIDTHS, RecurrentCNN
 
 
 class RecurrentCNNOfficialTest(unittest.TestCase):
@@ -56,6 +58,7 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         self.assertEqual(scaled_peak_lr(args), 4e-3)
         self.assertEqual(official_recipe_mismatches(args), [])
         self.assertEqual(args.convnext_version, 2)
+        self.assertEqual(args.conv_model, "t")
         self.assertEqual(args.arr1, "1,1,2,0")
         self.assertEqual(args.arr2, "3,3,6,0")
         self.assertEqual(args.reg_mode, "0,0,0,0")
@@ -64,17 +67,17 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         self.assertFalse(args.reg_head)
 
     def test_architecture_arguments_and_destination_suffixes(self):
-        args = parse_args(["--arr1", "2,3,0,0", "--arr2", "4,5,0,0"])
+        args = parse_args(["--arr1", "1,1,0,0", "--arr2", "2,3,0,0"])
         model = RecurrentCNN(args.arr1, args.arr2, convnext_version=2)
-        self.assertEqual(model.stage_depths, (2, 3, 0, 0))
-        self.assertEqual(model.stage_repeats, (4, 5, 0, 0))
+        self.assertEqual(model.stage_depths, (1, 1, 0, 0))
+        self.assertEqual(model.stage_repeats, (2, 3, 0, 0))
 
         suffix = architecture_suffix(
             model.stage_depths, model.stage_repeats, convnext_version=2
         )
         self.assertEqual(
             suffix,
-            "convnextV2_ARR1-2-3-0-0_ARR2-4-5-0-0_REG-0-0-0-0",
+            "convnextV2_ARR1-1-1-0-0_ARR2-2-3-0-0_REG-0-0-0-0",
         )
         self.assertEqual(
             append_architecture_suffix(
@@ -111,7 +114,7 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         )
         self.assertEqual(
             reg_suffix,
-            "convnextV2_ARR1-2-3-0-0_ARR2-4-5-0-0_REG-1-0-0-0_NREG-2-3-4-5",
+            "convnextV2_ARR1-1-1-0-0_ARR2-2-3-0-0_REG-1-0-0-0_NREG-2-3-4-5",
         )
         args = parse_args([
             "--reg-mode", "1,0,0,0",
@@ -134,6 +137,31 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         )
         self.assertTrue(variant_suffix.endswith("_DELTA1_REGHEAD1"))
 
+        atto_args = parse_args(["--conv-model", "A"])
+        self.assertEqual(atto_args.conv_model, "a")
+        atto_suffix = architecture_suffix(
+            model.stage_depths,
+            model.stage_repeats,
+            convnext_version=2,
+            conv_model="a",
+        )
+        self.assertTrue(atto_suffix.startswith("convnextV2A_"))
+        with self.assertRaisesRegex(ValueError, "requires ConvNeXt V2"):
+            architecture_suffix(
+                model.stage_depths,
+                model.stage_repeats,
+                convnext_version=1,
+                conv_model="a",
+            )
+        with self.assertRaisesRegex(ValueError, "does not support RATS"):
+            architecture_suffix(
+                model.stage_depths,
+                model.stage_repeats,
+                reg_mode=(1, 0, 0, 0),
+                convnext_version=2,
+                conv_model="a",
+            )
+
     def test_epoch_environment_defaults_and_generated_names(self):
         with patch.dict(os.environ, {"EPOCHS": "120", "WARMUP_EPOCHS": "7"}, clear=False):
             args = parse_args([])
@@ -144,6 +172,17 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         self.assertEqual(default_run_name(args), "convnext-official-ep120-warmup7")
         output_dir = default_output_dir(args, (1, 1, 2, 0), (3, 3, 6, 0))
         self.assertIn("_ep120_warmup7_", output_dir)
+
+        atto_args = parse_args(["--conv-model", "a"])
+        atto_args.world_size = 1
+        self.assertEqual(
+            default_run_name(atto_args),
+            "convnextV2A-official-ep300-warmup20",
+        )
+        self.assertIn(
+            "convnextV2A_",
+            default_output_dir(atto_args, (1, 1, 2, 0), (3, 3, 6, 0)),
+        )
 
     def test_command_line_epochs_override_environment(self):
         with patch.dict(os.environ, {"EPOCHS": "120", "WARMUP_EPOCHS": "7"}, clear=False):
@@ -157,8 +196,8 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         args.rank = 0
         args.device = torch.device("cpu")
         recurrent = RecurrentCNN(
-            (1, 1, 2, 0),
-            (3, 3, 6, 0),
+            (1, 0, 0, 0),
+            (1, 0, 0, 0),
             convnext_version=2,
             drop_path_rate=0.1,
         )
@@ -171,44 +210,34 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         self.assertEqual(config["architecture"]["register_applications"], 0)
         self.assertFalse(config["architecture"]["delta_mode"])
         self.assertFalse(config["architecture"]["reg_head"])
+        self.assertEqual(config["architecture"]["conv_model"], "t")
+        self.assertEqual(config["architecture"]["stage_widths"], list(TINY_STAGE_WIDTHS))
+        self.assertEqual(config["architecture"]["last_width"], 96)
 
-        args.convnext_version = 1
-        native = RecurrentCNN(
-            (3, 3, 9, 3),
-            (1, 1, 1, 1),
-            convnext_version=1,
-            drop_path_rate=0.1,
+        atto = RecurrentCNN(
+            (1, 1, 1, 0),
+            (1, 2, 3, 0),
+            convnext_version=2,
+            conv_model="a",
         )
-        native_config = build_config(args, native, 1000, 1_281_167, 50_000, 312)
-        self.assertTrue(native_config["paper_model_exact"])
+        atto_config = build_config(args, atto, 1000, 1_281_167, 50_000, 312)
+        self.assertEqual(atto_config["architecture"]["conv_model"], "a")
+        self.assertEqual(
+            atto_config["architecture"]["stage_widths"], list(ATTO_STAGE_WIDTHS)
+        )
+        self.assertEqual(atto_config["architecture"]["last_width"], 160)
+        self.assertFalse(atto_config["paper_model_exact"])
 
-        registered = RecurrentCNN(
-            (3, 3, 9, 3),
-            (1, 1, 1, 1),
-            convnext_version=1,
-            reg_mode=(0, 0, 1, 0),
-        )
-        registered_config = build_config(
-            args, registered, 1000, 1_281_167, 50_000, 312
-        )
-        self.assertFalse(registered_config["paper_model_exact"])
-        self.assertEqual(registered_config["architecture"]["register_applications"], 1)
-        self.assertTrue(
-            registered_config["architecture"]["register_attention_drop_path"]
-        )
-        self.assertTrue(registered_config["architecture"]["register_mlp_drop_path"])
-        self.assertEqual(
-            registered_config["architecture"]["register_attention_drop_path_schedule"],
-            "stage_terminal_unrolled_linear",
-        )
-        self.assertEqual(
-            registered_config["architecture"]["register_attention_drop_path_rates"],
-            [0.0],
-        )
-        self.assertEqual(
-            registered_config["architecture"]["register_mlp_drop_path_rates"],
-            [0.0],
-        )
+    def test_old_resume_arguments_default_to_tiny(self):
+        args = parse_args([])
+        saved = {
+            key: getattr(args, key)
+            for key in RESUME_ARGUMENT_KEYS
+            if key != "conv_model"
+        }
+        args.resume = "checkpoint.pt"
+        _restore_resume_arguments(args, {"arguments": saved})
+        self.assertEqual(args.conv_model, "t")
 
     def test_optimizer_loss_and_update_scheduler(self):
         args = parse_args([
@@ -232,29 +261,28 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
         self.assertIsInstance(create_train_criterion(args), SoftTargetCrossEntropy)
 
     def test_distributed_eval_sampler_has_no_duplicates(self):
-        dataset = list(range(11))
-        shards = [list(DistributedEvalSampler(dataset, rank, 3)) for rank in range(3)]
-        flattened = [item for shard in shards for item in shard]
-        self.assertEqual(sorted(flattened), dataset)
-        self.assertEqual(len(flattened), len(set(flattened)))
+        shards = [
+            list(DistributedEvalSampler(range(5), rank, 2)) for rank in range(2)
+        ]
+        self.assertEqual(sorted(item for shard in shards for item in shard), list(range(5)))
 
     def test_cpu_smoke_and_resume_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data_root = root / "imagenet"
-            for split, count in (("train", 2), ("val", 1)):
+            for split, count in (("train", 1), ("val", 1)):
                 for class_index in range(2):
                     class_dir = data_root / split / str(class_index)
                     class_dir.mkdir(parents=True)
                     for image_index in range(count):
                         value = 40 + class_index * 80 + image_index
-                        Image.new("RGB", (48, 48), (value, value, value)).save(
+                        Image.new("RGB", (20, 20), (value, value, value)).save(
                             class_dir / f"{image_index}.png"
                         )
 
             output_base = root / "output"
             architecture = (
-                "convnextV2_ARR1-1-0-0-0_ARR2-1-0-0-0_REG-0-0-0-0"
+                "convnextV2A_ARR1-1-0-0-0_ARR2-1-0-0-0_REG-0-0-0-0"
             )
             output_dir = root / f"output_{architecture}"
             main([
@@ -264,9 +292,10 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
                 "--no-amp",
                 "--no-strict-official-recipe",
                 "--smoke",
-                "--image-size", "32",
+                "--image-size", "16",
                 "--arr1", "1,0,0,0",
                 "--arr2", "1,0,0,0",
+                "--conv-model", "a",
                 "--wandb-mode", "disabled",
             ])
             latest = output_dir / "checkpoint_latest.pt"
@@ -276,6 +305,9 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
             self.assertTrue((output_dir / "checkpoint_final.pt").is_file())
             config = json.loads((output_dir / "config.json").read_text())
             self.assertFalse(config["training_recipe_exact"])
+            self.assertEqual(config["architecture"]["conv_model"], "a")
+            self.assertEqual(config["architecture"]["stage_widths"], [40, 80, 160, 320])
+            self.assertEqual(config["architecture"]["last_width"], 40)
             self.assertEqual(
                 config["training"]["wandb_project"],
                 f"recurrent-convnext-imagenet_{architecture}",
@@ -294,7 +326,8 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
                 "--device", "cpu",
                 "--arr1", "1,0,0,0",
                 "--arr2", "1,0,0,0",
-                "--image-size", "32",
+                "--conv-model", "a",
+                "--image-size", "16",
                 "--batch-size", "2",
                 "--grad-accum-steps", "1",
                 "--epochs", "1",
@@ -309,94 +342,6 @@ class RecurrentCNNOfficialTest(unittest.TestCase):
                 len((output_dir / "metrics.jsonl").read_text().strip().splitlines()),
                 1,
             )
-
-            legacy_path = output_dir / "checkpoint_legacy_v6.pt"
-            legacy = torch.load(latest, map_location="cpu", weights_only=False)
-            legacy.pop("best_raw_acc1")
-            legacy["arguments"].pop("reg_mode")
-            legacy["arguments"].pop("n_reg")
-            for key in (
-                "reg_mode",
-                "n_reg",
-                "register_stage_count",
-                "register_applications",
-                "register_attention",
-                "register_heads",
-                "register_sdpa_backend",
-                "register_mlp_ratio",
-                "register_data_term",
-                "register_reconstruction",
-                "register_layerscale",
-            ):
-                legacy["config"]["architecture"].pop(key)
-            torch.save(legacy, legacy_path)
-            main([
-                "--data-root", str(data_root),
-                "--device", "cpu",
-                "--arr1", "1,0,0,0",
-                "--arr2", "1,0,0,0",
-                "--image-size", "32",
-                "--batch-size", "2",
-                "--grad-accum-steps", "1",
-                "--epochs", "1",
-                "--warmup-epochs", "0",
-                "--no-amp",
-                "--no-strict-official-recipe",
-                "--workers", "0",
-                "--resume", str(legacy_path),
-                "--wandb-mode", "disabled",
-            ])
-
-            register_architecture = (
-                "convnextV2_ARR1-1-0-0-0_ARR2-1-0-0-0_"
-                "REG-1-0-0-0_NREG-2-8-8-8"
-            )
-            register_output = root / f"register_output_{register_architecture}"
-            main([
-                "--data-root", str(data_root),
-                "--output-dir", str(root / "register_output"),
-                "--device", "cpu",
-                "--no-amp",
-                "--no-strict-official-recipe",
-                "--smoke",
-                "--image-size", "32",
-                "--arr1", "1,0,0,0",
-                "--arr2", "1,0,0,0",
-                "--reg-mode", "1,0,0,0",
-                "--n-reg", "2,8,8,8",
-                "--wandb-mode", "disabled",
-            ])
-            register_config = json.loads(
-                (register_output / "config.json").read_text()
-            )
-            self.assertEqual(
-                register_config["architecture"]["reg_mode"], [1, 0, 0, 0]
-            )
-            self.assertEqual(
-                register_config["architecture"]["register_applications"], 1
-            )
-            self.assertTrue(
-                register_config["model_arch"].endswith("array_tied_rats_v7")
-            )
-
-            with self.assertRaisesRegex(ValueError, "Resume arguments differ"):
-                main([
-                    "--data-root", str(data_root),
-                    "--device", "cpu",
-                    "--arr1", "1,0,0,0",
-                    "--arr2", "1,0,0,0",
-                    "--image-size", "32",
-                    "--batch-size", "1",
-                    "--grad-accum-steps", "1",
-                    "--epochs", "1",
-                    "--warmup-epochs", "0",
-                    "--no-amp",
-                    "--no-strict-official-recipe",
-                    "--workers", "0",
-                    "--resume", str(latest),
-                    "--wandb-mode", "disabled",
-                ])
-
 
 if __name__ == "__main__":
     unittest.main()

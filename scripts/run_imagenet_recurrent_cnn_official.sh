@@ -22,17 +22,21 @@ PYTHON_BIN="${PYTHON_BIN:-/home/jhu/cyang140/.conda/envs/peq-fla/bin/python}"
 DATA_ROOT="${DATA_ROOT:-/home/jhu/cyang140/scratch_abhatt40/cyang140/datasets/imagenet}"
 
 V="${V:-2}"
-ARR1="${ARR1:-3,3,3,1}"
-ARR2="${ARR2:-1,1,3,3}"
+CONV_MODEL="${CONV_MODEL:-a}"
+CONV_MODEL="${CONV_MODEL,,}"
+ARR1="${ARR1:-2,2,8,2}"
+ARR2="${ARR2:-3,3,3,3}"
 REG_MODE="${REG_MODE:-0,0,0,0}"
 N_REG="${N_REG:-8,8,64,8}"
 DELTA_MODE="${DELTA_MODE:-0}"
 REG_HEAD="${REG_HEAD:-0}"
+export DELTA_BACKEND="${DELTA_BACKEND:-fla}"
+export DELTA_CHUNK_SIZE="${DELTA_CHUNK_SIZE:-64}"
 DROP_PATH_RATE="${DROP_PATH_RATE:-0.1}"
 EPOCHS="${EPOCHS:-300}"
 WARMUP_EPOCHS="${WARMUP_EPOCHS:-20}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-BS_PER_GPU="${BS_PER_GPU:-512}"
+BS_PER_GPU="${BS_PER_GPU:-256}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4096}"
 BASE_LR="${BASE_LR:-4e-3}"
 REFERENCE_BATCH_SIZE="${REFERENCE_BATCH_SIZE:-4096}"
@@ -54,6 +58,10 @@ if [[ "${V}" != "1" && "${V}" != "2" ]]; then
     echo "V must be 1 or 2, got ${V}" >&2
     exit 1
 fi
+if [[ "${CONV_MODEL}" != "t" && "${CONV_MODEL}" != "a" ]]; then
+    echo "CONV_MODEL must be t or a, got ${CONV_MODEL}" >&2
+    exit 1
+fi
 if [[ ! "${ARR1}" =~ ^[0-9]+(,[0-9]+){3}$ ]]; then
     echo "ARR1 must contain exactly four comma-separated non-negative integers" >&2
     exit 1
@@ -64,6 +72,14 @@ if [[ ! "${ARR2}" =~ ^[0-9]+(,[0-9]+){3}$ ]]; then
 fi
 if [[ ! "${REG_MODE}" =~ ^[01](,[01]){3}$ ]]; then
     echo "REG_MODE must contain exactly four comma-separated 0/1 values" >&2
+    exit 1
+fi
+if [[ "${CONV_MODEL}" == "a" && "${V}" != "2" ]]; then
+    echo "CONV_MODEL=a requires V=2" >&2
+    exit 1
+fi
+if [[ "${CONV_MODEL}" == "a" && "${REG_MODE}" != "0,0,0,0" ]]; then
+    echo "CONV_MODEL=a does not support RATS registers" >&2
     exit 1
 fi
 if [[ ! "${N_REG}" =~ ^[1-9][0-9]*(,[1-9][0-9]*){3}$ ]]; then
@@ -130,8 +146,14 @@ if [[ "${REG_HEAD}" == "1" ]]; then
     REG_SUFFIX+="_REGHEAD1"
 fi
 RUN_SCHEDULE_SLUG="ep${EPOCHS}_warmup${WARMUP_EPOCHS}"
-WANDB_NAME="${WANDB_NAME:-convnext-official-ep${EPOCHS}-warmup${WARMUP_EPOCHS}-gbs${EFFECTIVE_BATCH_SIZE}-maxlr${PEAK_LR}}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_recurrent_official_convnextV${V}_ARR1-${ARR1_SLUG}_ARR2-${ARR2_SLUG}${REG_SUFFIX}_${RUN_SCHEDULE_SLUG}_gbs${EFFECTIVE_BATCH_SIZE}_maxlr${PEAK_LR}_seed${SEED}}"
+CONV_MODEL_SUFFIX=""
+WANDB_MODEL_NAME="convnext"
+if [[ "${CONV_MODEL}" == "a" ]]; then
+    CONV_MODEL_SUFFIX="A"
+    WANDB_MODEL_NAME="convnextV2A"
+fi
+WANDB_NAME="${WANDB_NAME:-${WANDB_MODEL_NAME}-official-ep${EPOCHS}-warmup${WARMUP_EPOCHS}-gbs${EFFECTIVE_BATCH_SIZE}-maxlr${PEAK_LR}}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/imagenet_recurrent_official_convnextV${V}${CONV_MODEL_SUFFIX}_ARR1-${ARR1_SLUG}_ARR2-${ARR2_SLUG}${REG_SUFFIX}_${RUN_SCHEDULE_SLUG}_gbs${EFFECTIVE_BATCH_SIZE}_maxlr${PEAK_LR}_seed${SEED}}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2
@@ -171,6 +193,7 @@ TRAIN_ARGS=(
     --reg-mode "${REG_MODE}"
     --n-reg "${N_REG}"
     --convnext-version "${V}"
+    --conv-model "${CONV_MODEL}"
     --drop-path-rate "${DROP_PATH_RATE}"
     --batch-size "${BS_PER_GPU}"
     --grad-accum-steps "${GRAD_ACCUM_STEPS}"
@@ -225,7 +248,7 @@ COMMAND=(
     "${TRAIN_ARGS[@]}"
 )
 
-echo "model=convnext V=${V} ARR1=${ARR1} ARR2=${ARR2} REG_MODE=${REG_MODE} N_REG=${N_REG} DELTA_MODE=${DELTA_MODE} REG_HEAD=${REG_HEAD} drop_path_rate=${DROP_PATH_RATE}"
+echo "model=convnext CONV_MODEL=${CONV_MODEL} V=${V} ARR1=${ARR1} ARR2=${ARR2} REG_MODE=${REG_MODE} N_REG=${N_REG} DELTA_MODE=${DELTA_MODE} REG_HEAD=${REG_HEAD} drop_path_rate=${DROP_PATH_RATE}"
 echo "delta_backend=${DELTA_BACKEND} delta_chunk_size=${DELTA_CHUNK_SIZE} triton_cache_dir=${TRITON_CACHE_DIR}"
 echo "gpus=${GPUS_PER_NODE} batch_per_gpu=${BS_PER_GPU} accum=${GRAD_ACCUM_STEPS} effective_batch_size=${EFFECTIVE_BATCH_SIZE}"
 if (( 10#${EPOCHS} == 300 && 10#${WARMUP_EPOCHS} == 20 && GLOBAL_BATCH_SIZE == 4096 )); then

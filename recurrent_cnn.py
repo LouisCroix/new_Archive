@@ -34,7 +34,14 @@ except ImportError:
 
 
 EXPERIMENT_VERSION = 8
-STAGE_WIDTHS = (96, 192, 384, 768)
+TINY_STAGE_WIDTHS = (96, 192, 384, 768)
+ATTO_STAGE_WIDTHS = (40, 80, 160, 320)
+CONV_MODEL_STAGE_WIDTHS = {
+    "t": TINY_STAGE_WIDTHS,
+    "a": ATTO_STAGE_WIDTHS,
+}
+# Backward-compatible alias used by the standard trainer, which remains Tiny.
+STAGE_WIDTHS = TINY_STAGE_WIDTHS
 DEFAULT_STAGE_DEPTHS = (1, 1, 1, 0)
 DEFAULT_STAGE_REPEATS = (12, 12, 12, 0)
 DEFAULT_REG_MODE = (0, 0, 0, 0)
@@ -118,14 +125,30 @@ def validate_register_arrays(
     return modes, counts
 
 
+def validate_conv_model(value, convnext_version=2, reg_mode=DEFAULT_REG_MODE):
+    """Normalize the Tiny/Atto selector and reject unsupported combinations."""
+    conv_model = str(value).lower()
+    if conv_model not in CONV_MODEL_STAGE_WIDTHS:
+        raise ValueError(f"CONV_MODEL must be t or a, got {value!r}")
+    version = validate_convnext_version(convnext_version)
+    modes, _ = validate_register_arrays(reg_mode, DEFAULT_N_REG)
+    if conv_model == "a" and version != 2:
+        raise ValueError("CONV_MODEL=a requires ConvNeXt V2")
+    if conv_model == "a" and any(modes):
+        raise ValueError("CONV_MODEL=a does not support RATS registers")
+    return conv_model
+
+
 def model_arch_name(
     version,
     reg_mode=DEFAULT_REG_MODE,
     delta_mode=False,
     reg_head=False,
+    conv_model="t",
 ):
     version = validate_convnext_version(version)
     modes, _ = validate_register_arrays(reg_mode, DEFAULT_N_REG)
+    conv_model = validate_conv_model(conv_model, version, modes)
     if delta_mode or reg_head:
         variants = []
         if delta_mode:
@@ -135,7 +158,8 @@ def model_arch_name(
         suffix = f"four_stage_array_tied_rats_{'_'.join(variants)}_v8"
     else:
         suffix = "four_stage_array_tied_rats_v7" if any(modes) else "four_stage_array_tied_v6"
-    return f"recurrent_convnext_v{version}_{suffix}"
+    model_suffix = "_atto" if conv_model == "a" else ""
+    return f"recurrent_convnext_v{version}{model_suffix}_{suffix}"
 
 
 def validate_stage_arrays(stage_depths, stage_repeats):
@@ -448,11 +472,16 @@ class RecurrentCNN(nn.Module):
         n_reg=DEFAULT_N_REG,
         delta_mode=False,
         reg_head=False,
+        conv_model="t",
     ):
         super().__init__()
         depths, repeats = validate_stage_arrays(stage_depths, stage_repeats)
         reg_mode, n_reg = validate_register_arrays(reg_mode, n_reg, depths)
         self.convnext_version = validate_convnext_version(convnext_version)
+        self.conv_model = validate_conv_model(
+            conv_model, self.convnext_version, reg_mode
+        )
+        self.stage_widths = CONV_MODEL_STAGE_WIDTHS[self.conv_model]
         self.stage_depths = depths
         self.stage_repeats = repeats
         self.reg_mode = reg_mode
@@ -460,7 +489,7 @@ class RecurrentCNN(nn.Module):
         self.delta_mode = bool(delta_mode)
         self.reg_head = bool(reg_head)
         self.active_stages = sum(depth > 0 for depth in depths)
-        self.last_width = STAGE_WIDTHS[self.active_stages - 1]
+        self.last_width = self.stage_widths[self.active_stages - 1]
         self.unique_blocks = sum(depths)
         self.block_applications = sum(
             depth * repeat for depth, repeat in zip(depths, repeats)
@@ -489,7 +518,7 @@ class RecurrentCNN(nn.Module):
         self.drop_path_schedule = "unrolled_linear"
         self.register_drop_path_schedule = "stage_terminal_unrolled_linear"
 
-        stem_width = 96
+        stem_width = self.stage_widths[0]
         stem_norm = partial(LayerNorm2d, eps=1e-6)
         self.stem = nn.Sequential(
             nn.Conv2d(3, stem_width, kernel_size=4, stride=4, bias=True),
@@ -503,7 +532,7 @@ class RecurrentCNN(nn.Module):
         register_drop_path_rates = []
         drop_path_offset = 0
         for stage_index in range(self.active_stages):
-            width = STAGE_WIDTHS[stage_index]
+            width = self.stage_widths[stage_index]
             stage = nn.Sequential(
                 *(
                     self._make_convnext_block(width, self.convnext_version)
@@ -540,7 +569,9 @@ class RecurrentCNN(nn.Module):
                 )
             )
             if stage_index + 1 < self.active_stages:
-                features.append(self._make_downsample(width, STAGE_WIDTHS[stage_index + 1]))
+                features.append(
+                    self._make_downsample(width, self.stage_widths[stage_index + 1])
+                )
         self.features = nn.ModuleList(features)
         self.register_drop_path_rates = tuple(register_drop_path_rates)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))

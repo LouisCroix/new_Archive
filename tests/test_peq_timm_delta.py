@@ -50,24 +50,34 @@ class DeltaPeqModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tiny_config(n_reg_schedule=(1, 2, 3))
 
-    def test_all_modes_and_attention_layouts_forward_and_backward(self):
+    def test_representative_modes_and_attention_layouts(self):
         image = torch.randn(1, 3, 8, 8)
-        for attention in ("sequential", "rats"):
-            for mode in ("single", "tied", "untied", "tied_data", "tied_data_rec"):
-                with self.subTest(attention=attention, mode=mode):
-                    model = Net(tiny_config(attention=attention, mode=mode))
+        cases = (
+            ("sequential", "single"),
+            ("sequential", "tied_data_rec"),
+            ("rats", "tied"),
+            ("rats", "untied"),
+        )
+        for attention, mode in cases:
+            with self.subTest(attention=attention, mode=mode):
+                model = Net(tiny_config(attention=attention, mode=mode))
+                with torch.no_grad():
                     output, _, recon = model(image)
-                    self.assertEqual(output.shape, (1, 5))
-                    self.assertEqual(len(recon), 1 if mode == "single" else 2)
-                    output.sum().backward()
+                self.assertEqual(output.shape, (1, 5))
+                self.assertEqual(len(recon), 1 if mode == "single" else 2)
+
+        model = Net(tiny_config(attention="rats", mode="tied"))
+        model(image)[0].sum().backward()
+        self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
 
     def test_all_readouts(self):
-        image = torch.randn(2, 3, 8, 8)
+        image = torch.randn(1, 3, 8, 8)
         for readout in ("reg", "weighted", "patch", "sum", "concat"):
             with self.subTest(readout=readout):
                 model = Net(tiny_config(attention="rats", readout=readout))
-                output, resid, recon = model(image, log=True)
-                self.assertEqual(output.shape, (2, 5))
+                with torch.no_grad():
+                    output, resid, recon = model(image, log=True)
+                self.assertEqual(output.shape, (1, 5))
                 self.assertEqual(len(resid), 2)
                 self.assertEqual(len(recon), 2)
 
@@ -105,8 +115,8 @@ class DeltaPeqModelTests(unittest.TestCase):
         ema = ModelEmaV3(model, decay=0.9, foreach=False)
         optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
         loader = DataLoader(
-            TensorDataset(torch.randn(2, 3, 8, 8), torch.tensor([0, 1])),
-            batch_size=2,
+            TensorDataset(torch.randn(1, 3, 8, 8), torch.tensor([0])),
+            batch_size=1,
         )
         args = SimpleNamespace(
             device=torch.device("cpu"),

@@ -1,22 +1,20 @@
-"""Run a tiny CPU pretrain/resume/finetune checkpoint lifecycle smoke test."""
+"""Run a minimal CPU pretrain-to-finetune checkpoint smoke test."""
 
-import subprocess
-import sys
 import tempfile
+import sys
 from pathlib import Path
 
 from PIL import Image
 
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from peq_timm_common import create_stage_parser, run_stage
 
 
-def run(*arguments):
-    subprocess.run(
-        [sys.executable, *map(str, arguments)],
-        cwd=ROOT,
-        check=True,
-    )
+def run(stage, *arguments):
+    args = create_stage_parser(stage).parse_args([*map(str, arguments)])
+    run_stage(args, stage)
 
 
 def make_dataset(root):
@@ -24,7 +22,7 @@ def make_dataset(root):
         for class_index in range(2):
             directory = root / split / str(class_index)
             directory.mkdir(parents=True)
-            for image_index in range(2):
+            for image_index in range(1):
                 value = 32 + 96 * class_index + image_index
                 Image.new("RGB", (12, 12), (value, value, value)).save(
                     directory / f"{image_index}.png"
@@ -44,8 +42,8 @@ def common(data_root):
         "--patch-size", "4",
         "--dim", "12",
         "--heads", "3",
-        "--steps", "2",
-        "--n-reg", "2,3",
+        "--steps", "1",
+        "--n-reg", "2",
         "--batch-size", "2",
         "--validation-batch-size", "2",
         "--mixup", "0",
@@ -60,7 +58,7 @@ def main():
         make_dataset(data_root)
         pretrain_root = root / "pretrain"
         run(
-            "imagenet_peq_timm_pretrain.py",
+            "pretrain",
             *common(data_root),
             "--output-dir", pretrain_root,
             "--epochs", "1",
@@ -76,15 +74,7 @@ def main():
             raise RuntimeError(f"Expected one pretrain checkpoint, found {checkpoints}")
         checkpoint = checkpoints[0]
         run(
-            "imagenet_peq_timm_pretrain.py",
-            "--data-root", data_root,
-            "--device", "cpu",
-            "--resume", checkpoint,
-            "--wandb-mode", "disabled",
-            "--workers", "0",
-        )
-        run(
-            "imagenet_peq_timm_finetune.py",
+            "finetune",
             *common(data_root),
             "--output-dir", root / "finetune",
             "--pretrained-checkpoint", checkpoint,

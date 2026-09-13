@@ -54,8 +54,10 @@ from recurrent_cnn import (
     DEFAULT_REG_MODE,
     REG_HEADS,
     REG_SDPA_BACKEND,
+    TINY_STAGE_WIDTHS,
     RecurrentCNN,
     model_arch_name,
+    validate_conv_model,
     validate_convnext_version,
     validate_register_arrays,
     validate_stage_arrays,
@@ -99,6 +101,7 @@ RESUME_ARGUMENT_KEYS = (
     "delta_mode",
     "reg_head",
     "convnext_version",
+    "conv_model",
     "drop_path_rate",
     "image_size",
     "epochs",
@@ -167,6 +170,13 @@ def parse_args(argv: Optional[list[str]] = None):
         help="concatenate final-stage register mean with pooled feature tokens",
     )
     parser.add_argument("--convnext-version", type=int, choices=(1, 2), default=2)
+    parser.add_argument(
+        "--conv-model",
+        type=str.lower,
+        choices=("t", "a"),
+        default="t",
+        help="ConvNeXt channel-width preset: Tiny (t) or V2 Atto (a)",
+    )
     parser.add_argument("--drop-path-rate", type=float, default=OFFICIAL_RECIPE["drop_path_rate"])
 
     parser.add_argument(
@@ -282,6 +292,7 @@ def _restore_resume_arguments(args, checkpoint: dict[str, Any]) -> None:
     saved.setdefault("n_reg", ",".join(map(str, DEFAULT_N_REG)))
     saved.setdefault("delta_mode", False)
     saved.setdefault("reg_head", False)
+    saved.setdefault("conv_model", "t")
     missing = [key for key in RESUME_ARGUMENT_KEYS if key not in saved]
     if missing:
         raise ValueError("Resume checkpoint is missing arguments: " + ", ".join(missing))
@@ -769,6 +780,7 @@ def build_config(
     mismatches = official_recipe_mismatches(args)
     paper_model_exact = (
         args.convnext_version == 1
+        and model.conv_model == "t"
         and model.stage_depths == NATIVE_TINY_DEPTHS
         and model.stage_repeats == NATIVE_TINY_REPEATS
         and not any(model.reg_mode)
@@ -780,6 +792,7 @@ def build_config(
             model.reg_mode,
             delta_mode=model.delta_mode,
             reg_head=model.reg_head,
+            conv_model=model.conv_model,
         ),
         "recipe": RECIPE_NAME,
         "training_recipe_exact": not mismatches and not args.smoke,
@@ -787,6 +800,9 @@ def build_config(
         "paper_model_exact": paper_model_exact,
         "architecture": {
             "convnext_version": args.convnext_version,
+            "conv_model": model.conv_model,
+            "stage_widths": list(model.stage_widths),
+            "last_width": model.last_width,
             "arr1": list(model.stage_depths),
             "arr2": list(model.stage_repeats),
             "reg_mode": list(model.reg_mode),
@@ -912,7 +928,8 @@ def synchronized_stop_requested(args) -> bool:
 
 
 def default_run_name(args) -> str:
-    return f"convnext-official-ep{args.epochs}-warmup{args.warmup_epochs}"
+    model = "convnextV2A" if args.conv_model == "a" else "convnext"
+    return f"{model}-official-ep{args.epochs}-warmup{args.warmup_epochs}"
 
 
 def architecture_suffix(
@@ -924,12 +941,15 @@ def architecture_suffix(
     convnext_version,
     delta_mode=False,
     reg_head=False,
+    conv_model="t",
 ) -> str:
     version = validate_convnext_version(convnext_version)
     arr1 = "-".join(map(str, depths))
     arr2 = "-".join(map(str, repeats))
     modes, counts = validate_register_arrays(reg_mode, n_reg, depths)
-    suffix = f"convnextV{version}_ARR1-{arr1}_ARR2-{arr2}"
+    conv_model = validate_conv_model(conv_model, version, modes)
+    model_name = f"convnextV{version}{'A' if conv_model == 'a' else ''}"
+    suffix = f"{model_name}_ARR1-{arr1}_ARR2-{arr2}"
     reg = "-".join(map(str, modes))
     suffix += f"_REG-{reg}"
     if any(modes):
@@ -952,6 +972,7 @@ def append_architecture_suffix(
     convnext_version,
     delta_mode=False,
     reg_head=False,
+    conv_model="t",
 ) -> str:
     value = str(value)
     suffix = architecture_suffix(
@@ -962,6 +983,7 @@ def append_architecture_suffix(
         convnext_version=convnext_version,
         delta_mode=delta_mode,
         reg_head=reg_head,
+        conv_model=conv_model,
     )
     return value if suffix in value else f"{value}_{suffix}"
 
@@ -975,6 +997,7 @@ def default_output_dir(args, depths, repeats) -> str:
         convnext_version=args.convnext_version,
         delta_mode=args.delta_mode,
         reg_head=args.reg_head,
+        conv_model=args.conv_model,
     )
     return (
         f"outputs/imagenet_recurrent_official_{suffix}_"
@@ -1003,6 +1026,17 @@ def run(args) -> None:
         _restore_resume_arguments(args, resume_checkpoint)
     if args.smoke:
         _apply_smoke_defaults(args)
+    depths, repeats = validate_stage_arrays(args.arr1, args.arr2)
+    reg_mode, n_reg = validate_register_arrays(
+        args.reg_mode,
+        args.n_reg,
+        depths,
+    )
+    args.conv_model = validate_conv_model(
+        args.conv_model, args.convnext_version, reg_mode
+    )
+    args.reg_mode = ",".join(map(str, reg_mode))
+    args.n_reg = ",".join(map(str, n_reg))
     if args.device.type != "cuda" and args.amp:
         LOG.warning("Disabling AMP on non-CUDA device %s", args.device)
         args.amp = False
@@ -1022,14 +1056,6 @@ def run(args) -> None:
                 f"checkpoint={saved_amp}, effective={args.amp}"
             )
 
-    depths, repeats = validate_stage_arrays(args.arr1, args.arr2)
-    reg_mode, n_reg = validate_register_arrays(
-        args.reg_mode,
-        args.n_reg,
-        depths,
-    )
-    args.reg_mode = ",".join(map(str, reg_mode))
-    args.n_reg = ",".join(map(str, n_reg))
     if not args.resume:
         output_base = args.output_dir or default_output_dir(args, depths, repeats)
         args.output_dir = append_architecture_suffix(
@@ -1041,6 +1067,7 @@ def run(args) -> None:
             convnext_version=args.convnext_version,
             delta_mode=args.delta_mode,
             reg_head=args.reg_head,
+            conv_model=args.conv_model,
         )
         args.wandb_project = append_architecture_suffix(
             args.wandb_project,
@@ -1051,6 +1078,7 @@ def run(args) -> None:
             convnext_version=args.convnext_version,
             delta_mode=args.delta_mode,
             reg_head=args.reg_head,
+            conv_model=args.conv_model,
         )
     args.wandb_name = args.wandb_name or default_run_name(args)
     if args.batch_size < 1 or args.grad_accum_steps < 1:
@@ -1098,6 +1126,7 @@ def run(args) -> None:
         n_reg=n_reg,
         delta_mode=args.delta_mode,
         reg_head=args.reg_head,
+        conv_model=args.conv_model,
     ).to(args.device)
     config = build_config(args, model, num_classes, train_size, val_size, updates_per_epoch)
 
@@ -1107,6 +1136,13 @@ def run(args) -> None:
             raise ValueError("Resume checkpoint has no valid config")
         saved_config = dict(saved_config)
         saved_architecture = dict(saved_config.get("architecture", {}))
+        saved_depths = tuple(saved_architecture.get("arr1", depths))
+        saved_active_stages = sum(depth > 0 for depth in saved_depths)
+        saved_architecture.setdefault("conv_model", "t")
+        saved_architecture.setdefault("stage_widths", list(TINY_STAGE_WIDTHS))
+        saved_architecture.setdefault(
+            "last_width", TINY_STAGE_WIDTHS[saved_active_stages - 1]
+        )
         saved_architecture.setdefault("reg_mode", list(DEFAULT_REG_MODE))
         saved_architecture.setdefault("n_reg", list(DEFAULT_N_REG))
         saved_architecture.setdefault("delta_mode", False)
@@ -1200,10 +1236,11 @@ def run(args) -> None:
 
     if is_primary(args):
         LOG.info(
-            "model=convnextV%d ARR1=%s ARR2=%s REG_MODE=%s N_REG=%s "
+            "model=convnextV%d%s ARR1=%s ARR2=%s REG_MODE=%s N_REG=%s "
             "DELTA_MODE=%s REG_HEAD=%s "
             "params=%d paper_model_exact=%s",
             args.convnext_version,
+            "A" if args.conv_model == "a" else "",
             depths,
             repeats,
             reg_mode,

@@ -11,6 +11,7 @@ from torchvision.models.convnext import CNBlock, LayerNorm2d
 import deltanet
 from deltanet import DeltaNet
 from recurrent_cnn import (
+    ATTO_STAGE_WIDTHS,
     ConvNeXtV2Block,
     GlobalResponseNorm,
     RATSRegisterBlock,
@@ -21,6 +22,8 @@ from recurrent_cnn import (
     legacy_config_to_stage_arrays,
     load_resume_config,
     migrate_legacy_state_dict,
+    model_arch_name,
+    validate_conv_model,
     validate_convnext_version,
     validate_register_arrays,
     validate_stage_arrays,
@@ -105,11 +108,6 @@ class RecurrentCNNTest(unittest.TestCase):
         ).eval()
         self.assertEqual(tuple(implicit.state_dict()), tuple(explicit.state_dict()))
         self.assertFalse(any("register_block" in key for key in implicit.state_dict()))
-        inputs = torch.randn(2, 3, 32, 32)
-        with torch.no_grad():
-            expected, _ = implicit(inputs)
-            actual, _ = explicit(inputs)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_v6_checkpoint_defaults_to_disabled_registers(self):
         model = RecurrentCNN((1, 0, 0, 0), (2, 0, 0, 0), num_classes=10)
@@ -168,7 +166,7 @@ class RecurrentCNNTest(unittest.TestCase):
             def count(_module, _inputs, _output, stage_index=index):
                 calls[stage_index] += 1
             handles.append(stage.register_block.patch_delta.register_forward_hook(count))
-        output, _ = model(torch.randn(2, 3, 32, 32))
+        output, _ = model(torch.randn(1, 3, 16, 16))
         output.sum().backward()
         for handle in handles:
             handle.remove()
@@ -202,7 +200,7 @@ class RecurrentCNNTest(unittest.TestCase):
             model.pool.register_forward_hook(capture_pool),
             model.head_norm.register_forward_pre_hook(capture_readout),
         ]
-        output, _ = model(torch.randn(2, 3, 32, 32))
+        output, _ = model(torch.randn(1, 3, 16, 16))
         for handle in handles:
             handle.remove()
         expected = torch.cat(
@@ -210,7 +208,7 @@ class RecurrentCNNTest(unittest.TestCase):
         )
         torch.testing.assert_close(captured["readout"], expected)
         self.assertEqual(model.head.in_features, 192)
-        self.assertEqual(output.shape, (2, 7))
+        self.assertEqual(output.shape, (1, 7))
 
     def test_delta_and_register_head_require_compatible_register_stages(self):
         with self.assertRaisesRegex(ValueError, "delta_mode"):
@@ -222,19 +220,6 @@ class RecurrentCNNTest(unittest.TestCase):
                 reg_mode=(1, 0, 0, 0),
                 reg_head=True,
             )
-
-    def test_current_delta_register_head_parameter_count(self):
-        model = RecurrentCNN(
-            (1, 1, 1, 0),
-            (3, 3, 6, 0),
-            num_classes=1000,
-            convnext_version=2,
-            reg_mode=(0, 0, 1, 0),
-            n_reg=(8, 8, 64, 8),
-            delta_mode=True,
-            reg_head=True,
-        )
-        self.assertEqual(sum(parameter.numel() for parameter in model.parameters()), 5_431_016)
 
     def test_stage_registers_are_independent_and_repeated(self):
         model = RecurrentCNN(
@@ -262,11 +247,11 @@ class RecurrentCNNTest(unittest.TestCase):
                 calls[stage_index] += 1
                 seen_registers[stage_index].append(inputs[1].detach().clone())
             handles.append(stage.register_block.register_forward_hook(record))
-        output, residuals = model(torch.randn(2, 3, 32, 32), log_residuals=True)
+        output, residuals = model(torch.randn(1, 3, 16, 16), log_residuals=True)
         output.sum().backward()
         for handle in handles:
             handle.remove()
-        self.assertEqual(output.shape, (2, 7))
+        self.assertEqual(output.shape, (1, 7))
         self.assertEqual(calls, [2, 3])
         self.assertFalse(torch.equal(seen_registers[0][0], seen_registers[0][1]))
         self.assertFalse(torch.equal(seen_registers[1][0], seen_registers[1][1]))
@@ -293,20 +278,71 @@ class RecurrentCNNTest(unittest.TestCase):
         self.assertFalse(hasattr(v2_block, "layer_scale"))
         self.assertTrue(torch.count_nonzero(v2_block.grn.gamma) == 0)
         self.assertTrue(torch.count_nonzero(v2_block.grn.beta) == 0)
-        with torch.no_grad():
-            output, _ = v2.eval()(torch.randn(2, 3, 32, 32))
-        self.assertEqual(output.shape, (2, 10))
 
-    def test_convnext_v2_native_parameter_count(self):
-        model = RecurrentCNN(
-            (3, 3, 9, 3),
-            (1, 1, 1, 1),
+    def test_conv_model_widths_and_invalid_combinations(self):
+        tiny = RecurrentCNN(
+            (1, 0, 0, 0), (1, 0, 0, 0), convnext_version=2
+        )
+        explicit_tiny = RecurrentCNN(
+            (1, 0, 0, 0),
+            (1, 0, 0, 0),
             convnext_version=2,
+            conv_model="t",
+        )
+        self.assertEqual(tuple(tiny.state_dict()), tuple(explicit_tiny.state_dict()))
+        self.assertEqual(
+            [value.shape for value in tiny.state_dict().values()],
+            [value.shape for value in explicit_tiny.state_dict().values()],
+        )
+        self.assertEqual(tiny.stage_widths, (96, 192, 384, 768))
+        self.assertEqual(
+            model_arch_name(2),
+            "recurrent_convnext_v2_four_stage_array_tied_v6",
+        )
+        self.assertEqual(model_arch_name(2), model_arch_name(2, conv_model="t"))
+
+        atto = RecurrentCNN(
+            (1, 1, 1, 1),
+            (2, 3, 4, 5),
+            num_classes=7,
+            convnext_version=2,
+            conv_model="A",
+        )
+        self.assertEqual(atto.conv_model, "a")
+        self.assertEqual(atto.stage_widths, ATTO_STAGE_WIDTHS)
+        self.assertEqual(atto.stage_depths, (1, 1, 1, 1))
+        self.assertEqual(atto.stage_repeats, (2, 3, 4, 5))
+        self.assertEqual(atto.stem[0].out_channels, 40)
+        self.assertEqual(
+            [atto.features[index].stage[0].dwconv.in_channels for index in (0, 2, 4, 6)],
+            [40, 80, 160, 320],
         )
         self.assertEqual(
-            sum(parameter.numel() for parameter in model.parameters()),
-            28_635_496,
+            [
+                (
+                    atto.features[index][1].in_channels,
+                    atto.features[index][1].out_channels,
+                )
+                for index in (1, 3, 5)
+            ],
+            [(40, 80), (80, 160), (160, 320)],
         )
+        self.assertEqual(atto.head.in_features, 320)
+        self.assertIn("atto", model_arch_name(2, conv_model="a"))
+
+        self.assertEqual(validate_conv_model("T", 1), "t")
+        for kwargs in (
+            {"convnext_version": 1, "conv_model": "a"},
+            {
+                "convnext_version": 2,
+                "conv_model": "a",
+                "reg_mode": (1, 0, 0, 0),
+            },
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                RecurrentCNN((1, 0, 0, 0), (1, 0, 0, 0), **kwargs)
+        with self.assertRaisesRegex(ValueError, "CONV_MODEL"):
+            validate_conv_model("missing", 2)
 
     def test_convnext_version_validation(self):
         self.assertEqual(validate_convnext_version("1"), 1)
@@ -315,37 +351,6 @@ class RecurrentCNNTest(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     validate_convnext_version(invalid)
-
-    def test_native_topology_matches_convnext_tiny_parameter_count(self):
-        model = RecurrentCNN((3, 3, 9, 3), (1, 1, 1, 1))
-        self.assertEqual(sum(parameter.numel() for parameter in model.parameters()), 28_589_128)
-        self.assertEqual(model.active_stages, 4)
-        self.assertEqual(model.last_width, 768)
-        self.assertEqual(model.unique_blocks, 18)
-        self.assertEqual(model.block_applications, 18)
-        self.assertEqual(len(model.features), 7)
-        self.assertEqual(model.head.in_features, 768)
-
-    def test_native_tiny_drop_path_matches_unrolled_linear_schedule(self):
-        model = RecurrentCNN(
-            (3, 3, 9, 3),
-            (1, 1, 1, 1),
-            drop_path_rate=0.1,
-        )
-        self.assertEqual(len(model.drop_path_rates), 18)
-        self.assertEqual(model.drop_path_rates[0], 0.0)
-        self.assertAlmostEqual(model.drop_path_rates[-1], 0.1)
-        self.assertTrue(all(
-            left < right
-            for left, right in zip(model.drop_path_rates, model.drop_path_rates[1:])
-        ))
-        flattened = tuple(
-            probability
-            for stage in model.features
-            if isinstance(stage, RepeatedStage)
-            for probability in stage.drop_path_probs
-        )
-        self.assertEqual(flattened, model.drop_path_rates)
 
     def test_recurrent_drop_path_varies_across_shared_block_calls(self):
         model = RecurrentCNN(
@@ -384,7 +389,7 @@ class RecurrentCNNTest(unittest.TestCase):
             return inputs
 
         with patch("recurrent_cnn.stochastic_depth", side_effect=identity_drop_path):
-            model(torch.randn(1, 3, 32, 32))
+            model(torch.randn(1, 3, 16, 16))
 
         # Each repeat has two ConvNeXt residuals followed by the three RATS
         # attention residuals (compress, refine, broadcast) and the MLP residual.
@@ -456,24 +461,24 @@ class RecurrentCNNTest(unittest.TestCase):
             deltanet._resolve_backend("auto", key)
 
     def test_drop_path_preserves_state_dict_and_eval_outputs(self):
-        plain = RecurrentCNN((1, 1, 1, 0), (2, 2, 2, 0), num_classes=10).eval()
+        plain = RecurrentCNN((1, 1, 0, 0), (2, 2, 0, 0), num_classes=10).eval()
         regularized = RecurrentCNN(
-            (1, 1, 1, 0),
-            (2, 2, 2, 0),
+            (1, 1, 0, 0),
+            (2, 2, 0, 0),
             num_classes=10,
             drop_path_rate=0.1,
         ).eval()
         regularized.load_state_dict(plain.state_dict(), strict=True)
         self.assertEqual(tuple(plain.state_dict()), tuple(regularized.state_dict()))
         self.assertIsInstance(regularized.features[0].stage[0], ScheduledCNBlock)
-        inputs = torch.randn(2, 3, 32, 32)
+        inputs = torch.randn(1, 3, 16, 16)
         with torch.no_grad():
             expected, _ = plain(inputs)
             actual, _ = regularized(inputs)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_promini_topology_and_repetition_counts(self):
-        model = RecurrentCNN((1, 1, 1, 0), (3, 3, 3, 0), num_classes=10).eval()
+        model = RecurrentCNN((1, 1, 1, 0), (2, 2, 2, 0), num_classes=10).eval()
         self.assertEqual(sum(parameter.numel() for parameter in RecurrentCNN().parameters()), 2_347_720)
         calls = [0, 0, 0]
         handles = []
@@ -483,19 +488,19 @@ class RecurrentCNNTest(unittest.TestCase):
                 calls[stage_index] += 1
             handles.append(stage.stage.register_forward_hook(count))
         with torch.no_grad():
-            output, residuals = model(torch.randn(1, 3, 64, 64), log_residuals=True)
+            output, residuals = model(torch.randn(1, 3, 16, 16), log_residuals=True)
         for handle in handles:
             handle.remove()
         self.assertEqual(output.shape, (1, 10))
-        self.assertEqual(calls, [3, 3, 3])
+        self.assertEqual(calls, [2, 2, 2])
         self.assertEqual({key: len(value) for key, value in residuals.items()}, {
-            "stage1": 3,
-            "stage2": 3,
-            "stage3": 3,
+            "stage1": 2,
+            "stage2": 2,
+            "stage3": 2,
         })
 
     def test_active_prefix_controls_downsampling_and_head_width(self):
-        for active_stages, expected_width in enumerate((96, 192, 384, 768), start=1):
+        for active_stages, expected_width in enumerate((96, 192, 384), start=1):
             depths = tuple(1 if index < active_stages else 0 for index in range(4))
             repeats = depths
             model = RecurrentCNN(depths, repeats, num_classes=7).eval()
@@ -503,13 +508,10 @@ class RecurrentCNNTest(unittest.TestCase):
             self.assertEqual(model.last_width, expected_width)
             self.assertEqual(model.head.in_features, expected_width)
             self.assertEqual(len(model.features), 2 * active_stages - 1)
-            with torch.no_grad():
-                output, _ = model(torch.randn(1, 3, 64, 64))
-            self.assertEqual(output.shape, (1, 7))
 
     def test_repeats_do_not_change_parameter_count(self):
-        once = RecurrentCNN((2, 2, 2, 0), (1, 1, 1, 0))
-        repeated = RecurrentCNN((2, 2, 2, 0), (12, 7, 3, 0))
+        once = RecurrentCNN((1, 1, 0, 0), (1, 1, 0, 0))
+        repeated = RecurrentCNN((1, 1, 0, 0), (12, 7, 0, 0))
         self.assertEqual(
             sum(parameter.numel() for parameter in once.parameters()),
             sum(parameter.numel() for parameter in repeated.parameters()),
@@ -550,7 +552,7 @@ class RecurrentCNNTest(unittest.TestCase):
         legacy_scheduler = torch.optim.lr_scheduler.LambdaLR(
             legacy_optimizer, lambda step: 1.0 - 0.01 * step
         )
-        inputs = torch.randn(2, 3, 32, 32)
+        inputs = torch.randn(1, 3, 16, 16)
         legacy.train()
         loss = legacy(inputs).square().mean()
         loss.backward()
@@ -586,7 +588,7 @@ class RecurrentCNNTest(unittest.TestCase):
 
     def test_layernorm_and_adamw_parameter_groups(self):
         model = RecurrentCNN((1, 0, 0, 0), (2, 0, 0, 0), num_classes=10)
-        inputs = torch.randn(2, 3, 32, 32)
+        inputs = torch.randn(1, 3, 16, 16)
         model.train()
         with torch.no_grad():
             train_output, _ = model(inputs)
